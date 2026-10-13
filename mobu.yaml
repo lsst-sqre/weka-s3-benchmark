@@ -1,0 +1,4 @@
+collection_rules:
+  - type: "intersect_union_of"
+    patterns:
+      - "Butler-fetch.ipynb"

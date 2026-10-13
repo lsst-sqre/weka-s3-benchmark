@@ -12,7 +12,7 @@ import sys
 from dataclasses import InitVar, asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Self
+from typing import Any, Callable, Self
 
 from lsst.daf.butler import Butler
 
@@ -162,12 +162,20 @@ class ResultMap:
         return [x.rm_speed_ratio for x in self.result_items]
         
     @property
-    def start_times(self) -> list[datetime.datetime | None]:
+    def start_times(self) -> list[datetime.datetime|None]:
         return [x.start_time for x in self.result_items]
 
     @property
-    def end_times(self) -> list[datetime.datetime | None]:
+    def end_times(self) -> list[datetime.datetime|None]:
         return [x.end_time for x in self.result_items]
+
+    @property
+    def elapsed_times(self) -> list[datetime.timedelta|None]:
+        return [x.elapsed_time for x in self.result_items]
+
+    @property
+    def urls(self) -> list[str]:
+        return [x.url for x in self.result_items]
     
     def calculate_statistics(self) -> None:
         """Statistics for HTTP fetch speed and size."""
@@ -334,29 +342,27 @@ class Dataset:
         How many URLs to actually retrieve.
     limit
         How many URLs to get handles for from the butler.
+    concurrency
+        How many fetches to dispatch at once.
     """
     display_name: str
     dataset_name: str
     count:int = 0
     limit:int = 10000
+    concurrency:int|None = None
 
 type DatasetList = list[Dataset]
 
 ################### End of data types for speed testing ###################
-
-#### Private helper class and type
-type _SizeCache = dict[str, int]
-
-@dataclass
-class _SpeedHelper:
-    start_time: datetime.datetime
-    end_time: datetime.datetime
-    reported_speed: str
-
+    
 #### Private utility functions
 
 def _now() -> datetime.datetime:
     return datetime.datetime.now(tz=datetime.UTC)
+
+def _cpus() -> int:
+    lim = os.getenv("CPU_LIMIT", "1")  # RSP-specific
+    return int(lim)
 
 def _have_results_check_result_map_items(
     initial: ResultMapItem, recheck:ResultMapItem, idx=int
@@ -415,6 +421,186 @@ def _t_to_spd(t_spd: str) -> float:
     else:
         return float(t_spd)
 
+#### Functions for concurrency management
+
+## Very loose typing.
+type ConcurrentFunction = Callable[_ItemHelper, Any]
+
+type _SizeCache = dict[str, int]
+
+@dataclass
+class _SpeedHelper:
+    start_time: datetime.datetime
+    end_time: datetime.datetime
+    reported_speed: str
+
+@dataclass
+class _ItemHelper:
+    index: int
+    count: int
+    initial_item: ResultMapItem
+    recheck_item: ResultMapItem|None
+    logger: logging.Logger
+    curl: str
+    cache: _SizeCache|None
+
+## Concurrency limiter
+
+async def _worker(
+    sema: asyncio.Semaphore,
+    fn: ConcurrentFunction,
+    item: _ItemHelper
+) -> None:
+    async with sema:
+        await fn(item)
+
+async def _concurrency_limiter(
+    fn: ConcurrentFunction,
+    items: list[_ItemHelper],
+    concurrency: int
+) -> None:
+    sema = asyncio.Semaphore(concurrency)
+    workers = [_worker(sema, fn, item) for item in items]
+    async with asyncio.TaskGroup() as tg:
+        for wkr in workers:
+            tg.create_task(wkr)
+
+## The '_find' functions retrieve data via HTTP.
+
+async def _find_size_for_item(
+    itempair: _ItemHelper
+) -> int:
+    """Return size of HTTP-accessible object.
+    The HEAD method is blocked, but a byte range will work."""
+    size_cache = itempair.cache
+    curl = itempair.curl
+    idx = itempair.index
+    count = itempair.count
+    logger = itempair.logger
+    url = itempair.initial_item.url
+    if url in size_cache:
+        sz = size_cache[url]
+        logger.debug(f"URL '{url}' found in size cache: {sz}")
+        return sz
+    logger.debug(f"Finding size for item {idx+1}/{count}")
+    proc = await asyncio.create_subprocess_exec(
+        curl, url, "-v", "-r", "0-0", "-o" "/dev/null",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode !=0:
+        raise RuntimeError(
+            f"Getting object size for '{url}' failed"
+            f" rc={proc.returncode},"
+            f" stdout='{stdout}',"
+            f" stderr='{stderr}'"
+        )
+    s_errl = stderr.decode().split("\n")
+    # find the content-range header.
+    # The total size is after the slash.
+    sz = int(
+        [x for x in s_errl
+            if x.startswith("< content-range:")
+        ][0].split("/")[-1]
+    )
+    size_cache[url]=sz
+    itempair.initial_item.size = sz
+    return sz
+
+async def _find_speed_pair(
+    itempair: _ItemHelper
+) -> None:
+    spdstr=f"speed for item {itempair.index+1}/{itempair.count}"
+    logger=itempair.logger
+    logger.debug(
+        f"Finding initial {spdstr}"
+    )
+    await _find_speed_for_item(itempair)
+    if itempair.recheck_item:
+        # This is just so all the called functions have the same shape and thus
+        # can be type ConcurrentFunction if we want.
+        new_item = _ItemHelper(
+            index=itempair.index,
+            count=itempair.count,
+            initial_item=itempair.recheck_item,
+            recheck_item=None,
+            logger=logger,
+            curl=itempair.curl,
+            cache=itempair.cache
+        )            
+        logger.debug(
+            f"Finding recheck {spdstr}"
+        )
+        # This is sequential to allow caching to happen.  Two pulls
+        # of the same URL, one after the other.  Different URLs
+        # can happen concurrently.
+        await _find_speed_for_item(new_item)
+
+async def _find_speed_for_item(
+    itempair: _ItemHelper
+)-> None:
+    """Updates result map item in place with HTTP fetch speed."""
+    res = await _fetch_item(itempair)
+    idx = itempair.index
+    count = itempair.count
+    item = itempair.initial_item
+    elapsed = res.end_time - res.start_time
+    speed_reported = _t_to_spd(res.reported_speed)
+    speed_measured = item.size / elapsed.total_seconds()
+    rm_speed_ratio = speed_reported / speed_measured
+    item.start_time = res.start_time
+    item.end_time = res.end_time
+    item.elapsed_time = elapsed
+    item.speed_reported = speed_reported
+    item.speed_measured = speed_measured
+    item.rm_speed_ratio = rm_speed_ratio
+    itempair.logger.debug(
+        f"Item {idx}/{count} "
+        f"reported {speed_reported:.02f} bytes/s;"
+        f" measured {speed_measured:.02f} bytes/s;"
+        f" ratio (r/m) {rm_speed_ratio:.03f}"
+    )
+
+async def _fetch_item(
+    itempair: _ItemHelper
+) -> _SpeedHelper:
+    """Get speed of transfer.
+
+    If we're slower than 50kB/s for 30 seconds, abort.  That will break
+    the run, because we won't have all the samples we expect, so no point
+    in catching a bad conversion."""
+    item=itempair.initial_item
+    curl=itempair.curl
+    proc = await asyncio.create_subprocess_exec(
+        curl, item.url, "-Y", "50000", "-o", "/dev/null",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    # Reported speed ought to be slightly higher than
+    # measured speed, because measured speed includes the overhead
+    # of starting the process.
+    #
+    # We bother to track it so we can scale-test and see if at some
+    # point, we have so many processes running that process thrashing
+    # is taking up a significant fraction of our (wall-clock) time.
+    st = _now()
+    stdout, stderr = await proc.communicate()
+    et = _now()
+    if proc.returncode !=0:
+        raise RuntimeError(
+            f"Getting fetch speed for '{item.url}' failed"
+            f" rc={proc.returncode},"
+            f" stdout='{stdout}',"
+            f" stderr='{stderr}'"
+        )
+    # Last field is speed (string, suffixed with binary units);
+    r_spd = stderr.decode().strip().split()[-1]
+    return _SpeedHelper(
+        start_time=st,
+        end_time=et,
+        reported_speed=r_spd
+    )
 #### Public functions
 
 def load_results_from_json(filename: Path) -> list[ResultMap]:
@@ -447,6 +633,8 @@ class Benchmarker:
         Datasets to range over during benchmarking run.
     output_dir
         Where to write output (defaults to cwd).
+    concurrency
+        How many fetches to run concurrently ($CPU_COUNT | 1)
     debug
         Whether to enable diagnostic output.
     recheck
@@ -460,6 +648,7 @@ class Benchmarker:
         butler_collections: str,
         datasetlist: DatasetList,
         output_dir: Path|None = None,
+        concurrency: int|None = None,
         debug: bool = False,
         recheck: bool = True
     ) -> None:
@@ -468,6 +657,11 @@ class Benchmarker:
         self._dslist = datasetlist
         self._debug = debug
         self._recheck = recheck
+        if concurrency is None:
+            concurrency = _cpus()
+        if concurrency < 1:
+            concurrency = 1
+        self._concurrency = concurrency
         self._curl = _get_curl()
         self._setup_logging()
         output_dir = output_dir if output_dir else Path(".")
@@ -475,6 +669,11 @@ class Benchmarker:
         self._size_cache: _SizeCache = {}
      
     def _setup_logging(self) -> None:
+        rootlgr = logging.getLogger()
+        # Get rid of root logger handlers
+        for hdl in rootlgr.handlers:
+            rootlgr.removeHandler(hdl)
+        # Create new logger
         lgr = logging.getLogger('Weka_Benchmarker')
         level = logging.DEBUG if self._debug else logging.WARNING
         lgr.setLevel(level)
@@ -536,7 +735,7 @@ class Benchmarker:
             )
             results.append(ratio_container)
             self._logger.debug(
-                f"Butler query of {name}({dsname}), limit={limit} count={count}..."
+                f"Butler query of {name}[{dsname}], sample {count} from {limit}..."
             )
             q_results = butler.query_datasets(
                 dsname, find_first=False, limit = limit
@@ -548,114 +747,40 @@ class Benchmarker:
             self._logger.debug(
                 f"   ...sampled {records} records with{r_p} recheck"
             )
+            ratio_container.count = records
             for url in urls:
                 initial_result_map.result_items.append(ResultMapItem(url=url))
                 if recheck:
                     recheck_result_map.result_items.append(ResultMapItem(url=url))
         return results
-
-    async def _get_size(self, url: str) -> int:
-        """Return size of HTTP-accessible object.
-        The HEAD method is blocked, but a byte range will work."""
-        curl = self._curl
-        if url in self._size_cache:
-            sz = size_cache[url]
-            self._logger.debug(f"URL '{url}' found in size cache: {sz}")
-            return sz
-        proc = await asyncio.create_subprocess_exec(
-            curl, url, "-v", "-r", "0-0", "-o" "/dev/null",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode !=0:
-            raise RuntimeError(
-                f"Getting object size for '{url}' failed"
-                f" rc={proc.returncode},"
-                f" stdout='{stdout}',"
-                f" stderr='{stderr}'"
-            )
-        s_errl = stderr.decode().split("\n")
-        # find the content-range header.
-        # The total size is after the slash.
-        sz = int(
-            [x for x in s_errl
-                if x.startswith("< content-range:")
-            ][0].split("/")[-1])
-        self._size_cache[url]=sz
-        return sz
-  
+        
     async def _get_all_sizes(
         self, result_map: ResultMap
     ) -> ResultMap:
         """Updates result_map in place with size of each HTTP object."""
         dataset = result_map.display_name
-        tot=len(result_map.result_items)
+        count=len(result_map.result_items)
+        hlp: list[_ItemHelper] = []
         for idx, item in enumerate(result_map.result_items):
-            self._logger.debug(
-                f"Getting size for {dataset}: {idx+1}/{tot}..."
+            hlp.append(
+                _ItemHelper(
+                    index=idx,
+                    count=count,
+                    initial_item=item,
+                    recheck_item=None,
+                    logger=self._logger,
+                    curl=self._curl,
+                    cache=self._size_cache
+                )
             )
-            item.size = await self._get_size(item.url)
-            self._logger.debug(f"    ...{item.size} bytes")
+        await _concurrency_limiter(
+            _find_size_for_item,
+            hlp,
+            self._concurrency
+        )
         return result_map
 
-    async def _find_speeds(self, url: str, size: int) -> _SpeedHelper:
-        """Get speed of transfer.
     
-        If we're slower than 50kB/s for 30 seconds, abort.  That will break the
-        run, because we won't have all the samples we expect, so no point in
-        catching a bad conversion."""
-        curl = self._curl
-        proc = await asyncio.create_subprocess_exec(
-            curl, url, "-Y", "50000", "-o", "/dev/null",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        # Reported speed ought to be slightly higher than
-        # measured speed, because measured speed includes the overhead
-        # of starting the process.
-        #
-        # We bother to track it so we can scale-test and see if at some
-        # point, we have so many processes running that process thrashing
-        # is taking up a significant fraction of our (wall-clock) time.
-        st = _now()
-        stdout, stderr = await proc.communicate()
-        et = _now()
-        if proc.returncode !=0:
-            raise RuntimeError(
-                f"Getting object size for '{url}' failed"
-                f" rc={proc.returncode},"
-                f" stdout='{stdout}',"
-                f" stderr='{stderr}'"
-            )
-        # Last field is speed (string, suffixed with binary units);
-        r_spd = stderr.decode().strip().split()[-1]
-        return _SpeedHelper(
-            start_time=st,
-            end_time=et,
-            reported_speed=r_spd
-        )
-
-    async def _find_speed_for_item(self, item: ResultMapItem) -> None:
-        """Updates result map item in place with HTTP fetch speed."""
-        size = item.size
-        res = await self._find_speeds(item.url, size)
-        elapsed = res.end_time - res.start_time
-        speed_reported = _t_to_spd(res.reported_speed)
-        speed_measured = size / elapsed.total_seconds()
-        rm_speed_ratio = speed_reported / speed_measured
-        item.start_time = res.start_time
-        item.end_time = res.end_time
-        item.elapsed_time = elapsed
-        item.speed_reported = speed_reported
-        item.speed_measured = speed_measured
-        item.rm_speed_ratio = rm_speed_ratio
-        self._logger.debug(
-            f"reported {speed_reported:.02f} bytes/s;"
-            f" measured {speed_measured:.02f} bytes/s;"
-            f" ratio (r/m) {rm_speed_ratio:.03f}"
-        )
-
     async def generate_results(self) -> ResultSet:
         """Get results and write them to a file.
 
@@ -677,18 +802,28 @@ class Benchmarker:
                     )
                 ratio_container._prepare_recheck_items()
                 ratio_container.validate_paired_resultmaps()
+            count = len(i_rm.result_items)
+            itempairs: list[_ItemHelper] = []
             for idx, i_item in enumerate(i_rm.result_items):
-                li = len(i_rm.result_items)
-                self._logger.debug(
-                    f"Finding initial speed for item #{idx+1}/{li}"
-                )
-                await self._find_speed_for_item(i_item)
+                r_item: ResultMapItem|None = None
                 if self._recheck:
                     r_item = r_rm.result_items[idx]
-                    self._logger.debug(
-                        f"Finding recheck speed for item #{idx+1}/{li}"
+                itempairs.append(
+                    _ItemHelper(
+                        index=idx,
+                        count=count,
+                        initial_item=i_item,
+                        recheck_item=r_item,
+                        logger=self._logger,
+                        curl=self._curl,
+                        cache=self._size_cache
                     )
-                    await self._find_speed_for_item(r_item)
+                )
+            await _concurrency_limiter(
+                _find_speed_pair,
+                itempairs,
+                self._concurrency
+            )
             i_rm.calculate_statistics()
             if self._recheck:
                 r_rm.calculate_statistics()
