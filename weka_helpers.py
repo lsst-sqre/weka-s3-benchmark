@@ -22,15 +22,13 @@ from pydantic.json_schema import SkipJsonSchema
 from typing import Annotated, Any, Callable, Self
 
 from lsst.daf.butler import Butler
+from lsst.rsp import get_node
 
 __all__ = [
     "Benchmarker",
     "Dataset",
     "DatasetList",
-    "PrimitiveRatioContainer",
-    "PrimitiveResultMap",
-    "PrimitiveResultMapItem",
-    "PrimitiveResultStatistics",
+    "Generation",
     "RatioContainer",
     "ResultMap",
     "ResultMapItem",
@@ -101,6 +99,14 @@ class Generation(StrEnum):
     INITIAL = "initial"
     RECHECK = "recheck"
 
+type SpeedTimes = dict[datetime,float]
+
+type ByteTimes = dict[datetime,int]
+
+class SpeedType(StrEnum):
+    MEASURED = "measured"
+    REPORTED = "reported"
+
 class ResultMap(BaseModel):
     """Results for a particular dataset."""
     display_name: str
@@ -146,6 +152,60 @@ class ResultMap(BaseModel):
     @property
     def urls(self) -> list[str]:
         return [x.url for x in self.result_items]
+
+    @property
+    def speed_deltas_reported(self) -> SpeedTimes:
+        return self._speed_deltas(SpeedType.REPORTED)
+
+    @property
+    def speed_deltas_measured(self) -> SpeedTimes:
+        return self._speed_deltas(SpeedType.MEASURED)
+
+    def _speed_deltas(self, speed_type: SpeedType) -> SpeedTimes:
+        attr="speed_" + speed_type
+        deltas = {}
+        for item in self.result_items:
+            value = getattr(item, attr)
+            # It's possible that two measurements start or end
+            # at the same instant.
+            initial_up = deltas.get(item.start_time, 0)
+            deltas[item.start_time] = initial_up + value
+            initial_down = deltas.get(item.end_time, 0)
+            deltas[item.end_time] = initial_down - value
+        return {
+            k: v for k, v in sorted(
+                deltas.items(),
+                key=lambda item: item[0]
+            )
+        }
+
+    @property
+    def aggregate_speeds_reported(self) -> SpeedTimes:
+        return self._aggregate_speeds(SpeedType.REPORTED)
+    
+    @property    
+    def aggregate_speeds_measured(self) -> SpeedTimes:
+        return self._aggregate_speeds(SpeedType.MEASURED)
+
+    def _aggregate_speeds(self, speed_type:SpeedType) -> SpeedTimes:
+        total_speed = 0
+        propname = "speed_deltas_" + speed_type
+        delta_series = getattr(self, propname)
+        speed_series:SpeedTimes = {}
+        for k,v in delta_series.items():
+            total_speed += v
+            speed_series[k] = total_speed
+        return speed_series
+
+    @property
+    def aggregate_bytes(self) -> ByteTimes:
+        retval: ByteTimes = {}
+        events=sorted(self.result_items, key = lambda x: x.end_time)
+        total_bytes = 0
+        for ev in events:
+            total_bytes += ev.bytes
+            retval[ev.end_time] = total_bytes
+        return retval
     
     def calculate_statistics(self) -> None:
         """Statistics for HTTP fetch speed and size."""
@@ -161,6 +221,8 @@ class RatioContainer(BaseModel):
     dataset_name: str
     count: int
     limit: int
+    node: str
+    user: str
     initial: ResultMap
     recheck: ResultMap | None = None
     ratios_measured: list[float] | None = None
@@ -251,6 +313,16 @@ def _cpus() -> int:
     lim = os.getenv("CPU_LIMIT", "1")  # RSP-specific
     return int(lim)
 
+def _get_curl() -> str:
+    """Return path to ``curl`` executable."""
+    curl = shutil.which("curl")
+    if not curl:
+        raise RuntimeError("'curl' must be on path")
+    return curl
+
+def _user() -> str:
+    return os.environ["USER"]
+
 def _have_results_check_result_map_items(
     initial: ResultMapItem, recheck:ResultMapItem, idx=int
 ) -> None:
@@ -287,15 +359,6 @@ def _sanity_check_result_map_items(
                 f"Size {i_sz} for {iid}"
                 f" does not match recheck size {r_sz}"
             )
-
-def _get_curl() -> str:
-    """Return path to ``curl`` executable."""
-    curl = shutil.which("curl")
-    if not curl:
-        raise RuntimeError("'curl' must be on path")
-    return curl
-    
-
 
 def _t_to_spd(t_spd: str) -> float:
     """Convert speed in suffixed units to integer."""
@@ -368,8 +431,7 @@ class Benchmarker:
     recheck
         Whether to pull each URL twice, to see caching effects on speed.
     """
-    
-    
+        
     def __init__(
         self,
         butler_config: str,
@@ -390,6 +452,7 @@ class Benchmarker:
         if concurrency < 1:
             concurrency = 1
         self._concurrency = concurrency
+        self._node = get_node()
         self._curl = _get_curl()
         self._setup_logging()
         output_dir = output_dir if output_dir else Path(".")
@@ -421,9 +484,9 @@ class Benchmarker:
         of_name += f"-{self._cfg}-{self._coll}"
         of_name += f"-{nnow.year}.{nnow.month:02d}.{nnow.day:02d}"
         of_name += f".{nnow.hour:02d}.{nnow.minute:02d}.{nnow.second:02d}"
-        of_name += f"-{os.getenv('USER')}.json"
+        of_name += f"-{self._node}"
+        of_name += f"-{_user()}.json"
         return datadir / of_name
-
 
     ## Concurrency limiter
 
@@ -488,6 +551,7 @@ class Benchmarker:
         )
         size_cache[url]=sz
         itempair.initial_item.size = sz
+        self._logger.debug(f"...{idx+1}/{count}: {sz}B")
         return sz
 
     async def _find_speed_pair(
@@ -626,6 +690,8 @@ class Benchmarker:
             ratio_container = RatioContainer(
                 display_name=name,
                 dataset_name=dsname,
+                node=self._node,
+                user=_user(),
                 count=count,
                 limit=limit,          
                 initial=initial_result_map,
@@ -674,7 +740,6 @@ class Benchmarker:
         )
         return result_map
 
-    
     async def generate_results(self) -> ResultSet:
         """Get results and write them to a file.
 
