@@ -34,7 +34,6 @@ __all__ = [
     "ResultMapItem",
     "ResultStatistics",
     "convert_results_to_primitive",
-    "generate_results",
     "load_results_from_json",
 ]
 
