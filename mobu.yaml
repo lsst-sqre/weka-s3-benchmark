@@ -2,3 +2,6 @@ collection_rules:
   - type: "intersect_union_of"
     patterns:
       - "Butler-fetch.ipynb"
+  - type: "exclude_union_of"
+    patterns:
+      - "Speed-plot.ipynb"
