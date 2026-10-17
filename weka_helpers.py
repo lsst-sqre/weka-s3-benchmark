@@ -9,6 +9,8 @@ import shutil
 import statistics
 import sys
 
+from abc import Sequence
+from collections import UserList
 from dataclasses import InitVar, asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -19,7 +21,7 @@ from pydantic import (
     model_validator
 )
 from pydantic.json_schema import SkipJsonSchema
-from typing import Annotated, Any, Callable, Self
+from typing import Annotated, Any, Callable, Self, TypeVar
 
 from lsst.daf.butler import Butler
 from lsst.rsp import get_node
@@ -30,14 +32,27 @@ __all__ = [
     "DatasetList",
     "Generation",
     "RatioContainer",
+    "RatioContainerList",
     "ResultMap",
     "ResultMapItem",
+    "ResultMapItemList",
+    "ResultMapList",
     "ResultStatistics",
     "convert_results_to_primitive",
     "load_results_from_json",
 ]
 
+########################## JSON typing #############################
+type J = dict[str,"J"] | list["J"] | str | int | float | bool | None
+
+def strip_null(seq: Sequence) -> Sequence:
+    return [x for x in seq if x is not None]
+
 ################### Data types for speed testing ###################
+_T = TypeVar('_T')
+
+
+
 class ResultMapItem(BaseModel):
     model_config = ConfigDict(
         ser_json_temporal="seconds",
@@ -46,26 +61,26 @@ class ResultMapItem(BaseModel):
     """Results for a single HTTP request."""
     url: str
     size: int = 0
-    start_time: datetime.datetime | str | None = None
-    end_time: datetime.datetime | str | None = None
-    elapsed_time: datetime.timedelta | float | None = None
-    speed_reported: float  = 0.0
+    start_time: datetime.datetime | None = None
+    end_time: datetime.datetime | None = None
+    speed_reported: float | None = None
     speed_measured: float | None = None
-    rm_speed_ratio: float | None = None
 
-    @model_validator(mode='after')
-    def _convert_times(self) -> Self:
-        """Convert JSON representation of time to Python objects."""
-        if isinstance(self.start_time, str):
-            self.start_time=datetime.datetime.gmtime(self.start_time)
-        if isinstance(self.end_time, str):
-            self.start_time=datetime.datetime.gmtime(self.end_time)        
-        if isinstance(self.elapsed_time, float):
-            self.elapsed_time=datetime.timedelta(seconds=self.elapsed_time)
-        return self
-            
+    @property
+    def elapsed_time(self) -> datetime.timedelta|None:
+        if not self.end_time:
+            return None
+        return self.end_time - self.start_time
+    
+    @property
+    def ratio(self) -> float|None:
+        if not self.speed_measured:
+            return None
+        if self.speed_reported is None:
+            return None
+        return self.speed_reported / self.speed_measured
 
-class ResultStatistics(BaseModel):
+class Statistics(BaseModel):
     """Statistics for a particular list of values."""
     CV: float | None = None
     mean: float | None = None
@@ -74,8 +89,8 @@ class ResultStatistics(BaseModel):
     pstdev: float | None = None
 
     @classmethod
-    def from_floats(cls, values: list[float]) -> Self:
-        if not values:
+    def from_list(cls, all_values: list[float|int|None]) -> Self:
+        if not all_values:
             return cls(
                 CV=None,
                 mean=None,
@@ -83,100 +98,104 @@ class ResultStatistics(BaseModel):
                 pvariance=None,
                 pstdev=None
             )
-        mean = statistics.mean(values)
-        pstdev = statistics.pstdev(values)
+        nums = [ x for x in all_values if x is not None ]
+        if not nums:
+            return cls(
+                CV=None,
+                mean=None,
+                median=None,
+                pvariance=None,
+                pstdev=None
+            )            
+        mean = statistics.mean(nums)
+        pstdev = statistics.pstdev(nums)
         cv = pstdev / mean if mean else None
         return cls(
             mean=mean,
-            median=statistics.median(values),
-            pvariance=statistics.pvariance(values),
+            median=statistics.median(nums),
+            pvariance=statistics.pvariance(nums),
             pstdev=pstdev,
             CV=cv
         )
 
-class Generation(StrEnum):
-    INITIAL = "initial"
-    RECHECK = "recheck"
+class ResultStatistics(BaseModel):
+    reported: Statistics
+    measured: Statistics
+    size: Statistics
+    reported_measured_ratio: Statistics
+    elapsed_time: Statistics
 
-type SpeedTimes = dict[datetime,float]
-
-type ByteTimes = dict[datetime,int]
+type TimeSeries = dict[datetime,float|int]
 
 class SpeedType(StrEnum):
     MEASURED = "measured"
     REPORTED = "reported"
 
-class ResultMap(BaseModel):
-    """Results for a particular dataset."""
-    display_name: str
-    dataset_name: str
-    count: int = 0
-    limit: int = 0
-    generation: Generation = Generation.INITIAL
-    debug: bool = False
-    result_items: list[ResultMapItem] = Field(default_factory=list)
-    object_size: ResultStatistics | None = None
-    speed_measured: ResultStatistics | None = None
-    speed_reported: ResultStatistics | None = None
-    rm_speed_ratio: ResultStatistics | None = None
-
-    @property
-    def sizes(self) -> list[int]:
-        return [x.size for x in self.result_items]
-
-    @property
-    def speeds_measured(self) -> list[float]:
-        return [x.speed_measured for x in self.result_items]
-
-    @property
-    def speeds_reported(self) -> list[float]:
-        return [x.speed_reported for x in self.result_items]
-
-    @property
-    def speeds_ratio(self) -> list[float]:
-        return [x.rm_speed_ratio for x in self.result_items]
-        
-    @property
-    def start_times(self) -> list[datetime.datetime|None]:
-        return [x.start_time for x in self.result_items]
-
-    @property
-    def end_times(self) -> list[datetime.datetime|None]:
-        return [x.end_time for x in self.result_items]
-
-    @property
-    def elapsed_times(self) -> list[datetime.timedelta|None]:
-        return [x.elapsed_time for x in self.result_items]
+class ResultMapItemList(UserList[_T]):
+    def __init__(self, iterable: Sequence[ResultMapItem]:
+        super().__init__(item for item in iterable)
 
     @property
     def urls(self) -> list[str]:
-        return [x.url for x in self.result_items]
+        return [x.url for x in self.data]
 
     @property
-    def speed_deltas_reported(self) -> SpeedTimes:
+    def sizes(self) -> list[int]:
+        return [x.size for x in self.data]
+
+    @property
+    def start_times(self) -> list[datetime.datetime|None]:
+        return [x.start_time for x in self.data]
+
+    @property
+    def end_times(self) -> list[datetime.datatime|None]:
+        return [x.end_time for x in self.data]
+
+    def elapsed_times(self) -> list[datetime.timedelta|None]:
+        return [x.elapsed_time for x in self.data]
+        
+    @property
+    def speeds_measured(self) -> list[float|None]:
+        return [x.speed_measured for x in self.data]
+
+    @property
+    def speeds_reported(self) -> list[float|None]:
+        return [x.speed_reported for x in self.data]
+
+    @property
+    def speeds_ratio(self) -> list[float]:
+        return [x.ratio() for x in self.data]
+
+    @property
+    def speed_deltas_reported(self) -> TimeSeries:
         return self._speed_deltas(SpeedType.REPORTED)
 
     @property
-    def speed_deltas_measured(self) -> SpeedTimes:
+    def speed_deltas_measured(self) -> TimeSeries:
         return self._speed_deltas(SpeedType.MEASURED)
 
-    def _speed_deltas(self, speed_type: SpeedType) -> SpeedTimes:
+    def _speed_deltas(self, speed_type: SpeedType) -> TimeSeries:
         attr="speed_" + speed_type
         deltas = {}
-        for item in self.result_items:
+        for item in self.data:
             value = getattr(item, attr)
             # It's possible that two measurements start or end
             # at the same instant.
-            initial_up = deltas.get(item.start_time, 0)
-            deltas[item.start_time] = initial_up + value
-            initial_down = deltas.get(item.end_time, 0)
-            deltas[item.end_time] = initial_down - value
+            if item.start_time is not None:
+                initial_up = deltas.get(item.start_time, 0)
+                deltas[item.start_time] = initial_up + value
+            if item.end_time is not None:
+                initial_down = deltas.get(item.end_time, 0)
+                deltas[item.end_time] = initial_down - value
         return {
             k: v for k, v in sorted(
                 deltas.items(),
                 key=lambda item: item[0]
             )
         }
+
+    @def events(self) -> list[datetime.datetime]:
+        return list(speed_deltas_reported.keys())
 
     @property
     def aggregate_speeds_reported(self) -> SpeedTimes:
@@ -197,21 +216,135 @@ class ResultMap(BaseModel):
         return speed_series
 
     @property
-    def aggregate_bytes(self) -> ByteTimes:
-        retval: ByteTimes = {}
-        events=sorted(self.result_items, key = lambda x: x.end_time)
+    def aggregate_bytes(self) -> TimeSeries:
+        retval: TimeSeries = {}
+        events=sorted(self.data, key = lambda x: x.end_time)
         total_bytes = 0
         for ev in events:
+            if ev.end_time is None:
+                continue
             total_bytes += ev.bytes
             retval[ev.end_time] = total_bytes
         return retval
+
+    @property
+    def total_bytes -> float:
+        return self.aggregate_bytes[-1]
+
+    @property
+    def total_elapsed_time -> datetime.timedelta:
+        return self.events[-1] - self.events[0]
+
+    @property
+    def average_speed(self) -> TimeSeries:
+        total_elapsed = self.events[-1] - self.events[0]
+        if not total_elapsed:
+            return None
+        return self.total_bytes/total_elapsed
+        
+    @property
+    def statistics(self) -> None:
+        """Statistics for HTTP fetch speed, size, and times."""
+        return ResultStatistics(
+            reported=Statistics.from_list(self.speeds_reported),
+            measured: Statistics.from_list(self.speeds_measured),
+            size: Statistics.from_list(self.sizes),
+            reported_measured_ratio: Statistics.from_list(self.speeds_ratio),
+            elapsed_times: Statistics.from_list(
+                [x.total_seconds() for x in self.elapsed_times
+                if x is not None]
+            )
+        )
+
+class Generation(StrEnum):
+    INITIAL = "initial"
+    RECHECK = "recheck"
+
+class ResultMap(BaseModel):
+    """Results for a particular dataset."""
+    display_name: str
+    dataset_name: str
+    count: int = 0
+    limit: int = 0
+    generation: Generation = Generation.INITIAL
+    debug: bool = False
+    result_items: ResultMapItemList = Field(default_factory=list)
+
+    @property
+    def sizes(self) -> list[int]:
+        return self.result_items.sizes
+
+    @property
+    def speeds_measured(self) -> list[float]:
+        return self.result_items.speeds_measured
+
+    @property
+    def speeds_reported(self) -> list[float]:
+        return self.result_items.speeds_reported
+
+    @property
+    def speeds_ratio(self) -> list[float]:
+        return [self.result_items.speeds_ratio
+        
+    @property
+    def start_times(self) -> list[datetime.datetime|None]:
+        return self.result_items.start_times
+
+    @property
+    def end_times(self) -> list[datetime.datetime|None]:
+        return self.result_items.end_times
+
+    @property
+    def elapsed_times(self) -> list[datetime.timedelta|None]:
+        return self.result_items.elapsed_times
+
+    @property
+    def urls(self) -> list[str]:
+        return self.result_items.urls
+
+    @property
+    def statistics(self) -> ResultStatistics:
+        return self.result_items.statistics
+
+    @property
+    def speed_deltas_reported(self) -> TimeSeries:
+        return self.result_items.speed_deltas.reported
+
+    @property
+    def speed_deltas_measured(self) -> TimeSeries:
+        return self.result_items.speed_deltas_measured
+
+    @def events(self) -> list[datetime.datetime]:
+        return self.result_items.events
+
+    @property
+    def aggregate_speeds_reported(self) -> SpeedTimes:
+        return self.result_items.aggregate_speeds_reported
     
-    def calculate_statistics(self) -> None:
-        """Statistics for HTTP fetch speed and size."""
-        self.object_size=ResultStatistics.from_floats(self.sizes)
-        self.speed_measured=ResultStatistics.from_floats(self.speeds_measured)
-        self.speed_reported=ResultStatistics.from_floats(self.speeds_reported)
-        self.rm_speed_ratio=ResultStatistics.from_floats(self.speeds_ratio)
+    @property    
+    def aggregate_speeds_measured(self) -> SpeedTimes:
+        return self.result_items.aggregate_speeds_measured
+
+    @property
+    def aggregate_bytes(self) -> TimeSeries:
+        return self.result_items.aggregate_bytes
+
+    @property
+    def total_bytes -> float:
+        return self.result_items.total_bytes
+
+    @property
+    def total_elapsed_time -> datetime.timedelta:
+        return self.result_items.total_elapsed_time
+
+    @property
+    def average_speed(self) -> TimeSeries:
+        return self.result_items.average_speed
+
+class ResultMapList(UserList[_T]):
+    """A list of ResultMaps with some special aggregation functions."""
+    def __init__(self, iterable: Sequence[ResultMap]:
+        super().__init__(item for item in iterable)
 
 class RatioContainer(BaseModel):
     """This always holds at least one series of data.  It may hold two;
@@ -274,7 +407,11 @@ class RatioContainer(BaseModel):
             rit.url = iit.url  # Copy, not reference
             rit.size = iit.size
 
-type ResultSet = list[RatioContainer]
+class RatioContainerList(UserList[_T]):
+    """A list of RatioContainers with some special properties."""
+    def __init__(self, iterable: Sequence[RatioContainer]:
+        super().__init__(item for item in iterable)
+
 # Configuration object class
 
 class Dataset(BaseModel):
@@ -291,7 +428,7 @@ class Dataset(BaseModel):
     limit
         How many URLs to get handles for from the butler.
     concurrency
-        How many fetches to dispatch at once.
+        How many fetches to dispatch at once (defaults to # of CPU cores).
     """
     display_name: str
     dataset_name: str
@@ -394,15 +531,15 @@ class _ItemPairHelper:
 
 def load_results_from_json(filename: Path) -> list[ResultMap]:
     """Read results from a persisted JSON file."""
-    res: ResultSet = []
+    res: RatioContainerList = []
     d_obj = json.loads(filename.read_text())
     for obj in d_obj:
         res.append(RatioContainer.model_validate(obj))
     return res
 
-def convert_results_to_primitive(res: ResultSet) -> dict[str,Any]:
+def convert_results_to_primitive(res: RatioContainerList) -> dict[str,Any]:
     """Convert results to JSON-representable form."""
-    retval: PrimitiveResultSet = []
+    retval: PrimitiveRatioContainerList = []
     for ratc in res:
         # This finesses datetime/timedelta
         retval.append(json.loads(ratc.model_dump_json()))
@@ -657,12 +794,12 @@ class Benchmarker:
             reported_speed=r_spd
         )
     
-    def _build_results(self) -> ResultSet:
+    def _build_results(self) -> RatioContainerList:
         """From a list of parameters for a given Butler config and
         collections, create a random sample of URLs to benchmark
         (optionally rechecking for caching).
         """
-        results: ResultSet = []
+        results: RatioContainerList = []
         butler = Butler(self._cfg, collections=self._coll)
         recheck = self._recheck
         for ds in self._dslist:
@@ -739,12 +876,12 @@ class Benchmarker:
         )
         return result_map
 
-    async def generate_results(self) -> ResultSet:
+    async def generate_results(self) -> RatioContainerList:
         """Get results and write them to a file.
 
         Returns
         -------
-        ResultSet
+        RatioContainerList
             Results from benchmarking run.
         """
         res = self._build_results()
