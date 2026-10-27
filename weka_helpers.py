@@ -122,67 +122,70 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
         },
         {
             "name": "start_time",
-            "type": "double",
+            "type": ["null", "double"],
         },
         {
             "name": "end_time",
-            "type": "double",
+            "type": ["null", "double"],
         },
         {
             "name": "speed_reported",
-            "type": "double",
+            "type": ["null", "double"],
         },
         {
             "name": "speed_measured",
-            "type": "double",
+            "type": ["null", "double"],
         },
         {
             "name": "node",
-            "type": "string",
+            "type": ["null", "string"],
         },
         {
             "name": "user",
-            "type": "string",
+            "type": ["null", "string"],
         },
         {
             "name": "generation",
-            "type": "string",
+            "type": ["null", "enum"],
+            "symbols": ["initial", "recheck"],
         },
         {
             "name": "location",
-            "type": "string",
+            "type": ["null", "enum"],
+            "symbols": ["Google", "USDF"],
         },
         {
             "name": "count",
-            "type": "long",
+            "type": ["null", "long"],
         },
         {
             "name": "limit",
-            "type": "long",
+            "type": ["null", "long"],
         },
         {
             "name": "butler_config",
-            "type": "string",
+            "type": ["null", "string"],
         },
         {
             "name": "butler_collections",
-            "type": "string",
+            "type": ["null", "string"],
         },
         {
             "name": "display_name",
-            "type": "string",
+            "type": ["null", "string"],
         },
         {
             "name": "dataset_name",
-            "type": "string",
+            "type": ["null", "string"],
         },
         {
             "name": "measurement_number",
-            "type": "long",
+            "type": ["null", "long"],
         },
         {
             "name": "debug",
             "type": "boolean",
+            "default": "false"
         },
     ]
 }
@@ -955,7 +958,9 @@ class Benchmarker:
         )
         records = [ { "value": m } for m in meas ]
         payload = {
-            "value_schema": _RESULT_MAP_ITEM_SASQUATCH_SCHEMA,
+            "value_schema": json.dumps(
+                _RESULT_MAP_ITEM_SASQUATCH_SCHEMA
+            ),
             "records": records
         }
         headers = {
