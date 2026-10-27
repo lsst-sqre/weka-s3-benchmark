@@ -56,7 +56,7 @@ _T = TypeVar('_T')
 
 
 
-class ResultMapItem(BaseModel):
+class ResultMapBaseItem(BaseModel):
     """Results for a single HTTP request."""
 
     model_config = ConfigDict(
@@ -70,6 +70,13 @@ class ResultMapItem(BaseModel):
     end_time: datetime.datetime | None = None
     speed_reported: float | None = None
     speed_measured: float | None = None
+    node: str | None = None
+    user: str | None = None
+    generation: Generation = Generation.INITIAL    
+    butler_config: str | None = None
+    butler_collections: str | None = None  
+    display_name: str | None = None
+    dataset_name: str | None = None
 
     @property
     def elapsed_time(self) -> datetime.timedelta|None:
@@ -353,6 +360,8 @@ class ResultMap(BaseModel):
     butler_collections: str           
     display_name: str
     dataset_name: str
+    node: str | None = None
+    user: str | None = None
     count: int = 0
     limit: int = 0
     generation: Generation = Generation.INITIAL
@@ -585,7 +594,7 @@ def _get_curl() -> str:
         raise RuntimeError("'curl' must be on path")
     return curl
 
-def _user() -> str:
+def _get_user() -> str:
     return os.environ["USER"]
 
 def _have_results_check_result_map_items(
@@ -807,7 +816,7 @@ class Benchmarker:
         of_name += f"-{nnow.year}.{nnow.month:02d}.{nnow.day:02d}"
         of_name += f".{nnow.hour:02d}.{nnow.minute:02d}.{nnow.second:02d}"
         of_name += f"-{self._node}"
-        of_name += f"-{_user()}.json"
+        of_name += f"-{_get_user()}.json"
         return datadir / of_name
 
     ## Concurrency limiter
@@ -993,16 +1002,22 @@ class Benchmarker:
             count = ds.count
             limit = ds.limit
             recheck = ds.recheck
+            cfg = ds.butler_config
+            coll = ds.butler_collections
+            user = _get_user()
+            node = self._node
             if ((count <= 0) or (limit <= 0)):
                 continue
             initial_result_map = ResultMap(
-                butler_config=ds.butler_config,
-                butler_collections=ds.butler_collections,
-                display_name=ds.display_name,
-                dataset_name=ds.dataset_name,
+                butler_config=cfg,
+                butler_collections=coll,
+                display_name=name,
+                dataset_name=dsname,
                 count=count,
                 limit=limit,
-                generation=Generation.INITIAL
+                generation=Generation.INITIAL,
+                user=user,
+                node=node,
             )
             recheck_result_map = ResultMap(
                 butler_config=ds.butler_config,
@@ -1011,23 +1026,26 @@ class Benchmarker:
                 dataset_name=ds.dataset_name,
                 count=count,
                 limit=limit,
-                generation=Generation.RECHECK
+                generation=Generation.RECHECK,
+                user=user,
+                node=node,
             ) if ds.recheck else None
             ratio_container = RatioContainer(
-                butler_config=ds.butler_config,
-                butler_collections=ds.butler_collections,                
-                display_name=ds.display_name,
-                dataset_name=ds.dataset_name,
+                butler_config=cfg,
+                butler_collections=coll,
+                display_name=name,
+                dataset_name=dsname,
                 node=self._node,
-                user=_user(),
                 count=count,
-                limit=limit,          
+                limit=limit,
+                user=user,
                 initial=initial_result_map,
                 recheck=recheck_result_map,
             )
             results.append(ratio_container)
             self._logger.debug(
-                f"Butler query of {name}[{dsname}], sample {count} from {limit}..."
+                f"Butler query of {name}[{dsname}], "
+                f"sample {count} from {limit}..."
             )
             q_results = butler.query_datasets(
                 dsname, find_first=False, limit = limit
@@ -1041,9 +1059,33 @@ class Benchmarker:
             )
             ratio_container.count = records
             for url in urls:
-                initial_result_map.result_items.append(ResultMapItem(url=url))
+                initial_result_map.result_items.append(
+                    ResultMapItem(
+                        url=url,
+                        node=node,
+                        user=user,
+                        count=count,
+                        limit=limit,
+                        butler_config=cfg,
+                        butler_collections=coll,
+                        display_name=name,
+                        dataset_name=dsname,
+                        generation=Generation.INITIAL,
+                    ))
                 if recheck:
-                    recheck_result_map.result_items.append(ResultMapItem(url=url))
+                    recheck_result_map.result_items.append(
+                        ResultMapItem(
+                            url=url,
+                            node=node,
+                            user=user,
+                            count=count,
+                            limit=limit,
+                            butler_config=cfg,
+                            butler_collections=coll,
+                            display_name=name,
+                            dataset_name=dsname,
+                            generation=Generation.RECHECK,
+                        ))
         return results
         
     async def _get_all_sizes(
