@@ -26,8 +26,10 @@ from pydantic.json_schema import SkipJsonSchema, JsonSchemaValue
 from pydantic_core import core_schema
 from typing import Annotated, Any, Callable, Self, Sequence, TypeVar
 
+import httpx  # Already present in RSP
+
 from lsst.daf.butler import Butler
-from lsst.rsp import get_node
+from lsst.rsp import get_node, UnknownServiceError, RSPDiscovery
 
 __all__ = [
     "Benchmarker",
@@ -871,8 +873,7 @@ class Benchmarker:
         output_dir: Path|None = None,
         concurrency: int|None = None,
         debug: bool = False,
-        sasquatch_url: str | None = None,
-        sasquatch_token: str | None = None
+        send_to_sasquatch: bool = False,
     ) -> None:
         self._dslist = dataset_list
         self._debug = debug
@@ -884,15 +885,7 @@ class Benchmarker:
         self._concurrency = concurrency
         self._debug = debug
         self._sasquatch_client: httpx.AsyncClient | None = None
-        if sasquatch_url:
-            self._sasquatch_client = httpx.AsyncClient(
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {sasquatch_token}"
-                },
-                base_url=sasquatch_url,
-                follow_redirects=True,
-            )
+        self._send_to_sasquatch = send_to_sasquatch
         self._node = get_node()
         self._curl = _get_curl()
         self._setup_logging()
@@ -935,20 +928,50 @@ class Benchmarker:
         of_name += f"-{_get_user()}.json"
         return datadir / of_name
 
-    async def _send_results_to_sasquatch(self, res: RatioContainerList) -> None:
-        """Send results to Sasquatch, if it's configured."""
-        if not self._sasquatch_client:
-            return
-        client = self._sasquatch_client
-        meas: list[J] = []
-        for ratc in res:
-            meas.append([ x.model_dump_json() for x in res.measurements ])
-        for m in meas:
-            m["timestamp"] = m["start_time"]
-        resp = await client.get("/v3/clusters").json()
-        cluster_id = resp["data"][0]["cluster_id"]
+    async def _get_sasquatch_client(self) -> httpx.AsyncClient|None:
+        """Acquire a sasquatch client, if we can."""
+        token=RSPDiscovery.get_token()
+        wrn="; will not report to Sasquatch."
+        if not token:
+            self._logger.warning(
+                f"Could not acquire access token{wrn}"
+            )
+            return None
+        # It doesn't look like lsst.rsp gives us a way to get internal services.
+        # We also don't have rubin.repertoire available in the environment.
+        inst_url=os.getenv("EXTERNAL_INSTANCE_URL", None)
+        if not inst_url:
+            self._logger.warning(
+                f"Could not determine RSP instance URL{wrn}"
+            )
+            return None
+        client = httpx.AsyncClient(
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            follow_redirects=True,
+        )
+        resp = await client.get(f"{inst_url}/auth/api/v1/token-info")
+        resp.raise_for_status()
+        obj = resp.json()
+        scopes = obj.get("scopes",[])
+        if "write:sasquatch" not in scopes:
+            self._logger.warning(
+                f"'write:sasquatch' not in scopes {scopes}"
+            )
+            return None
+        base_url = f"{inst_url}/sasquatch-rest-proxy"
+        client.base_url = base_url
+        return client
+
+    async def _configure_topic(self, client: httpx.AsyncClient) -> None:
+        resp = await client.get("/v3/clusters")
+        resp.raise_for_status()
+        obj = resp.json()
+        cluster_id = obj["data"][0]["cluster_id"]
         topic_config = {
-            "topic_name": "lsst.benchmarking.wekaS3Metric",
+            "topic_name": "lsst.benchmark.wekaS3Metric",
             "partitions_count": 1,
             "replication_factor": 3
         }
@@ -956,6 +979,33 @@ class Benchmarker:
             f"/v3/clusters/{cluster_id}/topics",
             json=topic_config
         )
+        resp.raise_for_status()
+
+    def _assemble_measurements(self, res: RatioContainerList) -> list[J]:
+        """Create a list of JSON representations of all ResultMapItems."""
+        meas: list[J] = []
+        for ratc in res:
+            meas.append([ x.model_dump_json() for x in res.measurements ])
+        # Chronograf expects a column named "timestamp".
+        for m in meas:
+            m["timestamp"] = m["start_time"]
+        return meas
+    
+    async def _send_results_to_sasquatch(
+        self,
+        res: RatioContainerList
+    ) -> None:
+        """Send results to Sasquatch, if it's configured."""
+        if len(res) < 1:
+            return
+        if not self._send_to_sasquatch:
+            return
+        client = await self._get_sasquatch_client()
+        if not client:
+            return
+        await self._configure_topic(client)
+        meas = self._assemble_measurements()
+        # Put together the Avro schema definition and the measurements.
         records = [ { "value": m } for m in meas ]
         payload = {
             "value_schema": json.dumps(
@@ -967,12 +1017,16 @@ class Benchmarker:
             "Content-Type": "application/vnd.kafka.avro.v2+json",
             "Accept": "application/vnd.kafka.v2+json",
         }
-        resp = client.post(
-            "/topics/lsst.benchmarks.wekaS3Metric",
+        resp = await client.post(
+            "/topics/lsst.benchmark.wekaS3Metric",
             json=payload,
             headers=headers
         )
+        await client.aclose()
         resp.raise_for_status()
+        self._logger.debug(
+            f"Measurements sent to Sasquatch at {client.base_url}"
+        )
 
     ## Concurrency limiter
 
