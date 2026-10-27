@@ -54,9 +54,17 @@ def strip_null(seq: Sequence) -> Sequence:
 ################### Data types for speed testing ###################
 _T = TypeVar('_T')
 
+class Generation(StrEnum):
+    """Whether a measurement is the initial fetch or an immediate followup."""
+    INITIAL = "initial"
+    RECHECK = "recheck"
 
+class Location(StrEnum):
+    """Whether dataset is located at USDF or Google."""
+    GOOGLE = "Google",
+    USDF = "USDF"
 
-class ResultMapBaseItem(BaseModel):
+class ResultMapItem(BaseModel):
     """Results for a single HTTP request."""
 
     model_config = ConfigDict(
@@ -72,11 +80,16 @@ class ResultMapBaseItem(BaseModel):
     speed_measured: float | None = None
     node: str | None = None
     user: str | None = None
-    generation: Generation = Generation.INITIAL    
+    generation: Generation | None = None
+    location: Location | None = None
+    count: int | None = None
+    limit: int | None = None
     butler_config: str | None = None
     butler_collections: str | None = None  
     display_name: str | None = None
     dataset_name: str | None = None
+    measurement_number: int | None = None
+    debug: bool = False
 
     @property
     def elapsed_time(self) -> datetime.timedelta|None:
@@ -93,6 +106,86 @@ class ResultMapBaseItem(BaseModel):
         if self.speed_reported is None:
             return None
         return self.speed_reported / self.speed_measured
+
+_RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
+    "namespace": "lsst.benchmark",
+    "type": "record",
+    "name": "wekaS3Metric",
+    "fields": [
+        {
+            "name": "url",
+            "type": "string",
+        },
+        {
+            "name": "size",
+            "type": "long",
+        },
+        {
+            "name": "start_time",
+            "type": "double",
+        },
+        {
+            "name": "end_time",
+            "type": "double",
+        },
+        {
+            "name": "speed_reported",
+            "type": "double",
+        },
+        {
+            "name": "speed_measured",
+            "type": "double",
+        },
+        {
+            "name": "node",
+            "type": "string",
+        },
+        {
+            "name": "user",
+            "type": "string",
+        },
+        {
+            "name": "generation",
+            "type": "string",
+        },
+        {
+            "name": "location",
+            "type": "string",
+        },
+        {
+            "name": "count",
+            "type": "long",
+        },
+        {
+            "name": "limit",
+            "type": "long",
+        },
+        {
+            "name": "butler_config",
+            "type": "string",
+        },
+        {
+            "name": "butler_collections",
+            "type": "string",
+        },
+        {
+            "name": "display_name",
+            "type": "string",
+        },
+        {
+            "name": "dataset_name",
+            "type": "string",
+        },
+        {
+            "name": "measurement_number",
+            "type": "long",
+        },
+        {
+            "name": "debug",
+            "type": "boolean",
+        },
+    ]
+}
 
 class Statistics(BaseModel):
     """Statistics for a particular list of values."""
@@ -344,11 +437,6 @@ class ResultMapItemList(UserList[_T]):
             )
         )
 
-class Generation(StrEnum):
-    """Whether a measurement is the initial fetch or an immediate followup."""
-    INITIAL = "initial"
-    RECHECK = "recheck"
-
 class ResultMap(BaseModel):
     """Results for a particular dataset."""
 
@@ -362,9 +450,10 @@ class ResultMap(BaseModel):
     dataset_name: str
     node: str | None = None
     user: str | None = None
-    count: int = 0
-    limit: int = 0
-    generation: Generation = Generation.INITIAL
+    count: int | None = None
+    limit: int | None = None
+    generation: Generation | None = None
+    location: Location | None = None
     debug: bool = False
     result_items: ResultMapItemList = ResultMapItemList([])
 
@@ -502,6 +591,14 @@ class RatioContainer(BaseModel):
         def ratio_statistics_reported(self) -> Statistics:
             Statistics.from_list(self.ratios.reported)
 
+        @property
+        def measurements(self) -> list[ResultMapItem]:
+            retval: list[ResultMapItem] = []
+            retval.append(self.initial.result_items)
+            if self.recheck:
+                retval.append(self.recheck.result_items)
+            return retval
+
     def _validate_paired_resultmaps(self) -> None:
         # Ensure that the initial and recheck maps have the same
         # number of items, and that the urls and sizes of each
@@ -567,7 +664,8 @@ class Dataset(BaseModel):
     dataset_name: str
     count:int = 0
     limit:int = 10000
-    concurrency:int|None = None
+    location:Location | None = None
+    concurrency:int | None = None
     recheck:bool = True
     debug:bool = False
 
@@ -709,6 +807,7 @@ class _ItemPairHelper:
     count: int
     initial_item: ResultMapItem
     recheck_item: ResultMapItem|None
+    measurement_number: int|None
 
 #### Public functions
 
@@ -759,6 +858,8 @@ class Benchmarker:
         Number of fetches to do concurrently (defaults to $CPU_LIMIT or 1).
     debug
         Whether to emit debugging output (defaults to False).
+    sasquatch_url
+        Sasquatch URL to receive data, or None (defaults to None).
     """
         
     def __init__(
@@ -766,7 +867,9 @@ class Benchmarker:
         dataset_list: DatasetList,
         output_dir: Path|None = None,
         concurrency: int|None = None,
-        debug: bool = False
+        debug: bool = False,
+        sasquatch_url: str | None = None,
+        sasquatch_token: str | None = None
     ) -> None:
         self._dslist = dataset_list
         self._debug = debug
@@ -777,6 +880,16 @@ class Benchmarker:
         self._cfg, self._coll = self._get_cfg_and_coll()
         self._concurrency = concurrency
         self._debug = debug
+        self._sasquatch_client: httpx.AsyncClient | None = None
+        if sasquatch_url:
+            self._sasquatch_client = httpx.AsyncClient(
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {sasquatch_token}"
+                },
+                base_url=sasquatch_url,
+                follow_redirects=True,
+            )
         self._node = get_node()
         self._curl = _get_curl()
         self._setup_logging()
@@ -819,6 +932,43 @@ class Benchmarker:
         of_name += f"-{_get_user()}.json"
         return datadir / of_name
 
+    async def _send_results_to_sasquatch(self, res: RatioContainerList) -> None:
+        """Send results to Sasquatch, if it's configured."""
+        if not self._sasquatch_client:
+            return
+        client = self._sasquatch_client
+        meas: list[J] = []
+        for ratc in res:
+            meas.append([ x.model_dump_json() for x in res.measurements ])
+        for m in meas:
+            m["timestamp"] = m["start_time"]
+        resp = await client.get("/v3/clusters").json()
+        cluster_id = resp["data"][0]["cluster_id"]
+        topic_config = {
+            "topic_name": "lsst.benchmarking.wekaS3Metric",
+            "partitions_count": 1,
+            "replication_factor": 3
+        }
+        resp = await client.post(
+            f"/v3/clusters/{cluster_id}/topics",
+            json=topic_config
+        )
+        records = [ { "value": m } for m in meas ]
+        payload = {
+            "value_schema": _RESULT_MAP_ITEM_SASQUATCH_SCHEMA,
+            "records": records
+        }
+        headers = {
+            "Content-Type": "application/vnd.kafka.avro.v2+json",
+            "Accept": "application/vnd.kafka.v2+json",
+        }
+        resp = client.post(
+            "/topics/lsst.benchmarks.wekaS3Metric",
+            json=payload,
+            headers=headers
+        )
+        resp.raise_for_status()
+
     ## Concurrency limiter
 
     async def _worker(
@@ -853,6 +1003,7 @@ class Benchmarker:
         curl = self._curl
         idx = itempair.index
         count = itempair.count
+        measurement_number = itempair.measurement_number
         url = itempair.initial_item.url
         if url in size_cache:
             sz = size_cache[url]
@@ -887,7 +1038,7 @@ class Benchmarker:
 
     async def _find_speed_pair(
         self,
-        itempair: _ItemPairHelper
+        itempair: _ItemPairHelper,
     ) -> None:
         itemstr=f"item {itempair.index+1}/{itempair.count}"
         spdstr=f"speed for {itemstr}"
@@ -897,6 +1048,7 @@ class Benchmarker:
         await self._determine_speed_for_item(
             itempair.initial_item,
             itemstr,
+            itempair.measurement_number,
         )
         if itempair.recheck_item:
             self._logger.debug(
@@ -907,7 +1059,8 @@ class Benchmarker:
             # can happen concurrently.
             await self._determine_speed_for_item(
                 itempair.recheck_item,
-                itemstr
+                itemstr,
+                itempair.measurement_number,
             )
 
     ## Further helper methods for getting speed.
@@ -915,7 +1068,8 @@ class Benchmarker:
     async def _determine_speed_for_item(
         self,
         item: ResultMapItem,
-        itemstr: str
+        itemstr: str,
+        measurement_number: int
     )-> None:
         """Updates result map item in place with HTTP fetch speed.
         
@@ -930,6 +1084,7 @@ class Benchmarker:
         item.end_time = res.end_time
         item.speed_reported = speed_reported
         item.speed_measured = speed_measured
+        item.measurement_number = measurement_number
         self._logger.debug(
             f"{itemstr}:"
             f" reported {speed_reported:.02f} bytes/s;"
@@ -1006,6 +1161,8 @@ class Benchmarker:
             coll = ds.butler_collections
             user = _get_user()
             node = self._node
+            location = ds.location
+            debug = self._debug
             if ((count <= 0) or (limit <= 0)):
                 continue
             initial_result_map = ResultMap(
@@ -1018,6 +1175,7 @@ class Benchmarker:
                 generation=Generation.INITIAL,
                 user=user,
                 node=node,
+                location=location,
             )
             recheck_result_map = ResultMap(
                 butler_config=ds.butler_config,
@@ -1029,6 +1187,8 @@ class Benchmarker:
                 generation=Generation.RECHECK,
                 user=user,
                 node=node,
+                location=location,
+                debug=debug,
             ) if ds.recheck else None
             ratio_container = RatioContainer(
                 butler_config=cfg,
@@ -1041,6 +1201,8 @@ class Benchmarker:
                 user=user,
                 initial=initial_result_map,
                 recheck=recheck_result_map,
+                location=location,
+                debug=debug,
             )
             results.append(ratio_container)
             self._logger.debug(
@@ -1071,6 +1233,8 @@ class Benchmarker:
                         display_name=name,
                         dataset_name=dsname,
                         generation=Generation.INITIAL,
+                        location=location,
+                        debug=debug,
                     ))
                 if recheck:
                     recheck_result_map.result_items.append(
@@ -1085,6 +1249,8 @@ class Benchmarker:
                             display_name=name,
                             dataset_name=dsname,
                             generation=Generation.RECHECK,
+                            location=location,
+                            debug=debug,
                         ))
         return results
         
@@ -1102,6 +1268,7 @@ class Benchmarker:
                     count=count,
                     initial_item=item,
                     recheck_item=None,
+                    measurement_number=idx+1
                 )
             )
         await self._concurrency_limiter(
@@ -1137,6 +1304,7 @@ class Benchmarker:
                         count=count,
                         initial_item=i_item,
                         recheck_item=r_item,
+                        measurement_number=idx+1
                     )
                 )
             await self._concurrency_limiter(
@@ -1149,4 +1317,5 @@ class Benchmarker:
                 ratio_container.calculate_ratios()
         outp = convert_results_to_primitive(res)
         self._result_path.write_text(json.dumps(outp))
+        await self._send_results_to_sasquatch(res)
         return res
