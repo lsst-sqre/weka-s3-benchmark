@@ -126,65 +126,65 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
         },
         {
             "name": "start_time",
-            "type": ["null", "double"],
+            "type": "double",
         },
         {
             "name": "end_time",
-            "type": ["null", "double"],
+            "type": "double",
         },
         {
             "name": "speed_reported",
-            "type": ["null", "double"],
+            "type": "double",
         },
         {
             "name": "speed_measured",
-            "type": ["null", "double"],
+            "type":  "double",
         },
         {
             "name": "node",
-            "type": ["null", "string"],
+            "type": "string",
         },
         {
             "name": "user",
-            "type": ["null", "string"],
+            "type": "string",
         },
         # These next two are really enums, but then the namespace
         # gets in the way.
         {
             "name": "generation",
-            "type": ["null", "string"],
+            "type": "string",
         },
         {
             "name": "location",
-            "type": ["null", "string"],
+            "type": "string",
         },
         {
             "name": "count",
-            "type": ["null", "long"],
+            "type": "long",
         },
         {
             "name": "limit",
-            "type": ["null", "long"],
+            "type":  "long",
         },
         {
             "name": "butler_config",
-            "type": ["null", "string"],
+            "type": "string",
         },
         {
             "name": "butler_collections",
-            "type": ["null", "string"],
+            "type": "string",
         },
         {
             "name": "display_name",
-            "type": ["null", "string"],
+            "type": "string",
         },
         {
             "name": "dataset_name",
-            "type": ["null", "string"],
+            "type": "string",
         },
         {
             "name": "measurement_number",
-            "type": ["null", "long"],
+            "type":  "long",
         },
         {
             "name": "debug",
@@ -1089,10 +1089,12 @@ class Benchmarker:
         await client.aclose()
         try:
             resp.raise_for_status()
-        except Exception as exc:
-            logstr = self._get_failure_logstr(payload)
-            self._logger.exception(logstr)
-            raise
+        except httpx.HTTPStatusError:
+            self._logger.exception(
+            "Sasquatch REST Proxy returned %s: %s",
+            resp.status_code,
+            resp.text,
+        )
         self._logger.debug(
             f"Measurements sent to Sasquatch at {client.base_url}"
         )
