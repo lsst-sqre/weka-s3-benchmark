@@ -43,7 +43,6 @@ __all__ = [
     "ResultMapItemList",
     "ResultMapList",
     "ResultStatistics",
-    "convert_results_to_primitive",
     "load_results_from_json",
 ]
 
@@ -109,10 +108,13 @@ class ResultMapItem(BaseModel):
             return None
         return self.speed_reported / self.speed_measured
 
+SASQUATCH_NS="lsst.benchmark"
+SASQUATCH_DB="wekas3"
+
 _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
-    "namespace": "lsst.benchmark",
+    "namespace": SASQUATCH_NS,
     "type": "record",
-    "name": "wekaS3Metric",
+    "name": SASQUATCH_DB,
     "fields": [
         {
             "name": "url",
@@ -146,15 +148,15 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
             "name": "user",
             "type": ["null", "string"],
         },
+        # These next two are really enums, but then the namespace
+        # gets in the way.
         {
             "name": "generation",
-            "type": ["null", "enum"],
-            "symbols": ["initial", "recheck"],
+            "type": ["null", "string"],
         },
         {
             "name": "location",
-            "type": ["null", "enum"],
-            "symbols": ["Google", "USDF"],
+            "type": ["null", "string"],
         },
         {
             "name": "count",
@@ -187,7 +189,7 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
         {
             "name": "debug",
             "type": "boolean",
-            "default": "false"
+            "default": False
         },
     ]
 }
@@ -247,7 +249,16 @@ class SpeedType(StrEnum):
     MEASURED = "measured"
     REPORTED = "reported"
 
-class ResultMapItemList(UserList[_T]):
+class DumperUserList(UserList):
+
+    def model_dump(self) -> list[dict[str,Any]]:
+        return [ x.model_dump() for x in self.data ]
+    
+    def model_dump_json(self) -> str:
+        return json.dumps([ json.loads(x.model_dump_json())
+                            for x in self.data ])
+
+class ResultMapItemList(DumperUserList[_T]):
     """List of measurements with some additional methods."""
     def __init__(self, iterable: Sequence[ResultMapItem]):
         super().__init__(item for item in iterable)
@@ -298,7 +309,7 @@ class ResultMapItemList(UserList[_T]):
                     in instance.data]
             ),
         )
-        
+    
     @property
     def urls(self) -> list[str]:
         """Return urls fetched for measurements."""
@@ -552,8 +563,8 @@ class ResultMap(BaseModel):
         """Return average speed as total bytes transferred over all time."""
         return self.result_items.average_speed
 
-class ResultMapList(UserList[_T]):
-    """A list of ResultMaps with some special aggregation functions."""
+class ResultMapList(DumperUserList[_T]):
+    """A list of ResultMaps, possibly with some special features."""
     def __init__(self, iterable: Sequence[ResultMap]):
         super().__init__(item for item in iterable)    
 
@@ -585,24 +596,34 @@ class RatioContainer(BaseModel):
             _have_results_check_result_map_items(i_itm, r_itm, idx)
             m_ratios.append(r_itm.speed_measured / i_itm.speed_measured)
             r_ratios.append(r_itm.speed_reported / i_itm.speed_reported)
-        self.ratios_measured=m_ratios
-        self.ratios_reported=r_ratios
+        if m_ratios:
+            self.ratios_measured=m_ratios
+        if r_ratios:
+            self.ratios_reported=r_ratios
 
-        @property
-        def ratio_statistics_measured(self) -> Statistics:
-            Statistics.from_list(self.ratios.measured)
+    @property
+    def ratio_statistics_measured(self) -> Statistics | None:
+        if not self.ratios_measured:
+            self.calculate_ratios()
+        if not self.ratios_measured:
+            return None
+        return Statistics.from_list(self.ratios_measured)
 
-        @property
-        def ratio_statistics_reported(self) -> Statistics:
-            Statistics.from_list(self.ratios.reported)
+    @property
+    def ratio_statistics_reported(self) -> Statistics | None:
+        if not self.ratios_reported:
+            self.calculate_ratios()
+        if not self.ratios_reported:
+            return None
+        return Statistics.from_list(self.ratios_reported)
 
-        @property
-        def measurements(self) -> list[ResultMapItem]:
-            retval: list[ResultMapItem] = []
-            retval.append(self.initial.result_items)
-            if self.recheck:
-                retval.append(self.recheck.result_items)
-            return retval
+    @property
+    def measurements(self) -> ResultMapItemList:
+        retval = ResultMapItemList([])
+        retval.extend(list(self.initial.result_items))
+        if self.recheck:
+            retval.extend(list(self.recheck.result_items))
+        return retval
 
     def _validate_paired_resultmaps(self) -> None:
         # Ensure that the initial and recheck maps have the same
@@ -632,10 +653,17 @@ class RatioContainer(BaseModel):
             rit.url = iit.url  # Copy, not reference
             rit.size = iit.size
 
-class RatioContainerList(UserList[_T]):
+class RatioContainerList(DumperUserList[_T]):
     """A list of RatioContainers, possibly with some special properties."""
     def __init__(self, iterable: Sequence[RatioContainer]):
         super().__init__(item for item in iterable)
+
+    @property
+    def measurements(self) -> ResultMapItemList:
+        retval = ResultMapItemList([])
+        for ratc in self.data:
+            retval.extend(list(ratc.measurements))
+        return retval
 
 # Configuration object class
 
@@ -814,7 +842,12 @@ class _ItemPairHelper:
     recheck_item: ResultMapItem|None
     measurement_number: int|None
 
-#### Public functions
+@dataclass
+class _ClientHelper:
+    client: httpx.AsyncClient
+    token: str
+
+#### Public function
 
 def load_results_from_json(filename: Path) -> RatioContainerList:
     """Read results from a persisted JSON file.
@@ -838,15 +871,6 @@ def load_results_from_json(filename: Path) -> RatioContainerList:
             pyd_obj=_update_ratio_container_schema(obj, filename)
         res.append(pyd_obj)
     return res
-
-def convert_results_to_primitive(res: RatioContainerList) -> dict[str,Any]:
-    """Convert results to JSON-representable form."""
-    retval: J = []
-    for ratc in res:
-        # This finesses datetime/timedelta by roundtripping it through
-        # the ConfigDict temporal settings
-        retval.append(json.loads(ratc.model_dump_json()))
-    return retval
     
 #### Speed Tester class
 
@@ -927,8 +951,8 @@ class Benchmarker:
         of_name += f"-{self._node}"
         of_name += f"-{_get_user()}.json"
         return datadir / of_name
-
-    async def _get_sasquatch_client(self) -> httpx.AsyncClient|None:
+    
+    async def _get_sasquatch_client(self) -> _ClientHelper|None:
         """Acquire a sasquatch client, if we can."""
         token=RSPDiscovery.get_token()
         wrn="; will not report to Sasquatch."
@@ -963,15 +987,23 @@ class Benchmarker:
             return None
         base_url = f"{inst_url}/sasquatch-rest-proxy"
         client.base_url = base_url
-        return client
+        return _ClientHelper(
+            client=client,
+            token=token
+        )
 
     async def _configure_topic(self, client: httpx.AsyncClient) -> None:
+        """Configure Kafka topic."""
+        # This will cause a 400 in the logs if the topic already exists,
+        # which is why we skip it for now while we're debugging the
+        # Sasquatch ingest.  In normal operation it will tolerate
+        # attempting to create an existing topic.
         resp = await client.get("/v3/clusters")
         resp.raise_for_status()
         obj = resp.json()
         cluster_id = obj["data"][0]["cluster_id"]
         topic_config = {
-            "topic_name": "lsst.benchmark.wekaS3Metric",
+            "topic_name": ".".join([SASQUATCH_NS,SASQUATCH_DB]),
             "partitions_count": 1,
             "replication_factor": 3
         }
@@ -979,32 +1011,59 @@ class Benchmarker:
             f"/v3/clusters/{cluster_id}/topics",
             json=topic_config
         )
-        resp.raise_for_status()
+        if resp.status_code == 400 and "already exists" in resp.text:
+            pass
+        else:
+            try:
+                resp.raise_for_status()
+            except Exception:
+                if resp.status_code == 400 and "already exists" in resp.text:
+                    pass
+                else:
+                    self._logger.exception()
+                    raise
 
     def _assemble_measurements(self, res: RatioContainerList) -> list[J]:
-        """Create a list of JSON representations of all ResultMapItems."""
-        meas: list[J] = []
-        for ratc in res:
-            meas.append([ x.model_dump_json() for x in res.measurements ])
-        # Chronograf expects a column named "timestamp".
-        for m in meas:
-            m["timestamp"] = m["start_time"]
-        return meas
+        """Create a list of JSONable representations of all ResultMapItems."""
+        # Roundtripping through the JSON dumper to convert datetime
+        jsonable = [ json.loads(m.model_dump_json()) 
+                     for m in res.measurements ]
+        for meas in jsonable:
+            meas["timestamp"] = meas["start_time"]
+        return jsonable
+
+    def _get_failure_logstr(self, payload:J) -> str:
+        """Create a pretty-printed string for logging failure."""
+        schema = json.loads(payload["value_schema"])
+        first_record = payload["records"][0]["value"]
+        return(
+            "Failure sending to sasquatch:\n"
+            "----------\n"
+            "schema:\n"
+            f"{json.dumps(schema, indent=2)}\n"
+            "----------\n"
+            "first record:\n"
+            f"{json.dumps(first_record, indent=2)}\n"
+            "----------"
+        )
     
     async def _send_results_to_sasquatch(
         self,
-        res: RatioContainerList
+        res: RatioContainerList,
     ) -> None:
         """Send results to Sasquatch, if it's configured."""
         if len(res) < 1:
             return
         if not self._send_to_sasquatch:
             return
-        client = await self._get_sasquatch_client()
-        if not client:
+        chlp = await self._get_sasquatch_client()
+        if not chlp:
             return
-        await self._configure_topic(client)
-        meas = self._assemble_measurements()
+        client = chlp.client
+        token = chlp.token
+        # Skipping configuration for now to make logs cleaner.
+        # await self._configure_topic(client)
+        meas = self._assemble_measurements(res)
         # Put together the Avro schema definition and the measurements.
         records = [ { "value": m } for m in meas ]
         payload = {
@@ -1013,17 +1072,27 @@ class Benchmarker:
             ),
             "records": records
         }
+        # Don't think we need to add Authorization here; I think these
+        # are additive and that the headers on the post() override those
+        # in the client.  But let's see for sure.
+        del client.headers["content-type"]
         headers = {
             "Content-Type": "application/vnd.kafka.avro.v2+json",
             "Accept": "application/vnd.kafka.v2+json",
+            "Authorization": f"Bearer {token}",
         }
         resp = await client.post(
-            "/topics/lsst.benchmark.wekaS3Metric",
+            f"/topics/{'.'.join([SASQUATCH_NS,SASQUATCH_DB])}",
             json=payload,
             headers=headers
         )
         await client.aclose()
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            logstr = self._get_failure_logstr(payload)
+            self._logger.exception(logstr)
+            raise
         self._logger.debug(
             f"Measurements sent to Sasquatch at {client.base_url}"
         )
@@ -1205,7 +1274,7 @@ class Benchmarker:
         collections, create a random sample of URLs to benchmark
         (optionally rechecking for caching).
         """
-        results: RatioContainerList = []
+        results: RatioContainerList = RatioContainerList([])
         for ds in self._dslist:
             butler = Butler(
                 ds.butler_config,
@@ -1374,7 +1443,6 @@ class Benchmarker:
             if ratio_container.recheck:
                 ratio_container.recheck.statistics
                 ratio_container.calculate_ratios()
-        outp = convert_results_to_primitive(res)
-        self._result_path.write_text(json.dumps(outp))
+        self._result_path.write_text(res.model_dump_json())
         await self._send_results_to_sasquatch(res)
         return res
