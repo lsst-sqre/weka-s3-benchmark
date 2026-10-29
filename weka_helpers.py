@@ -9,11 +9,16 @@ import random
 import shutil
 import statistics
 import sys
-
 from collections import UserList
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any, Self, TypeVar
+
+import httpx  # Already present in RSP
+from lsst.daf.butler import Butler
+from lsst.rsp import RSPDiscovery, get_node
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -21,12 +26,6 @@ from pydantic import (
     ValidationError,
 )
 from pydantic_core import core_schema
-from typing import Any, Callable, Self, Sequence, TypeVar
-
-import httpx  # Already present in RSP
-
-from lsst.daf.butler import Butler
-from lsst.rsp import get_node, RSPDiscovery
 
 __all__ = [
     "Benchmarker",
@@ -597,7 +596,7 @@ class RatioContainer(BaseModel):
         m_ratios: list[float] = []
         r_ratios: list[float] = []
         if not self.recheck or not self.recheck.result_items:
-            return None
+            return
         self._validate_paired_resultmaps()
         for idx, i_itm in enumerate(self.initial.result_items):
             r_itm = self.recheck.result_items[idx]
@@ -815,8 +814,7 @@ class _extracted_from_filename:
         datestamp = splits[4] if lspl > 4 else "unknown_datestamp"
         node = splits[5:-1] if lspl > 6 else "unknown_node"
         user = splits[-1] if lspl > 6 else "unknown_user"
-        if user.endswith(".json"):
-            user = user[:-5]
+        user = user.removesuffix(".json")
         return cls(
             config=cfg,
             collections=coll,
@@ -930,8 +928,7 @@ class Benchmarker:
         self._debug = debug
         if concurrency is None:
             concurrency = _cpus()
-        if concurrency < 1:
-            concurrency = 1
+        concurrency = max(concurrency, 1)
         self._cfg, self._coll = self._get_cfg_and_coll()
         self._concurrency = concurrency
         self._debug = debug
@@ -945,10 +942,8 @@ class Benchmarker:
         self._size_cache: _SizeCache = {}
 
     def _get_cfg_and_coll(self) -> tuple[str]:
-        cfg = "+".join(list(set([x.butler_config for x in self._dslist])))
-        coll = "+".join(
-            list(set([x.butler_collections for x in self._dslist]))
-        )
+        cfg = "+".join(list({x.butler_config for x in self._dslist}))
+        coll = "+".join(list({x.butler_collections for x in self._dslist}))
         return (cfg, coll)
 
     def _setup_logging(self) -> None:
@@ -1021,7 +1016,7 @@ class Benchmarker:
         obj = resp.json()
         cluster_id = obj["data"][0]["cluster_id"]
         topic_config = {
-            "topic_name": ".".join([SASQUATCH_NS, SASQUATCH_DB]),
+            "topic_name": f"{SASQUATCH_NS}.{SASQUATCH_DB}",
             "partitions_count": 1,
             "replication_factor": 3,
         }
@@ -1096,7 +1091,7 @@ class Benchmarker:
             "Authorization": f"Bearer {token}",
         }
         resp = await client.post(
-            f"/topics/{'.'.join([SASQUATCH_NS, SASQUATCH_DB])}",
+            f"/topics/{f'{SASQUATCH_NS}.{SASQUATCH_DB}'}",
             json=payload,
             headers=headers,
         )
@@ -1150,7 +1145,7 @@ class Benchmarker:
             self.logger.debug(f"URL '{url}' found in size cache: {sz}")
             return sz
         self._logger.debug(
-            f"Finding size for item{measurement_number}/{count}"
+            f"Finding size for item {measurement_number}/{count}"
         )
         proc = await asyncio.create_subprocess_exec(
             curl,
@@ -1174,7 +1169,7 @@ class Benchmarker:
         # find the content-range header.
         # The total size is after the slash.
         sz = int(
-            [x for x in s_errl if x.startswith("< content-range:")][0].split(
+            next(x for x in s_errl if x.startswith("< content-range:")).split(
                 "/"
             )[-1]
         )
@@ -1353,7 +1348,7 @@ class Benchmarker:
             q_results = butler.query_datasets(
                 dsname, find_first=False, limit=limit
             )
-            records = count if len(q_results) > count else len(q_results)
+            records = min(len(q_results), count)
             urls = [
                 str(butler.getURI(x))
                 for x in random.sample(q_results, records)
@@ -1454,9 +1449,9 @@ class Benchmarker:
                 self._find_speed_pair,
                 itempairs,
             )
-            ratio_container.initial.statistics
+            _ = ratio_container.initial.statistics  # For side effects
             if ratio_container.recheck:
-                ratio_container.recheck.statistics
+                _ = ratio_container.recheck.statistics  # For side effects
                 ratio_container.calculate_ratios()
         self._result_path.write_text(res.model_dump_json())
         await self._send_results_to_sasquatch(res)
