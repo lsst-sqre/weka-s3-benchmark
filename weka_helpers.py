@@ -1,4 +1,5 @@
 """Helper functions and classes for Weka benchmarking."""
+
 import asyncio
 import datetime
 import json
@@ -9,27 +10,23 @@ import shutil
 import statistics
 import sys
 
-from abc import ABC, abstractmethod
 from collections import UserList
-from dataclasses import InitVar, asdict, dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from pydantic import (
     BaseModel,
     ConfigDict,
-    Field,
     GetCoreSchemaHandler,
     ValidationError,
-    model_validator
 )
-from pydantic.json_schema import SkipJsonSchema, JsonSchemaValue
 from pydantic_core import core_schema
-from typing import Annotated, Any, Callable, Self, Sequence, TypeVar
+from typing import Any, Callable, Self, Sequence, TypeVar
 
 import httpx  # Already present in RSP
 
 from lsst.daf.butler import Butler
-from lsst.rsp import get_node, UnknownServiceError, RSPDiscovery
+from lsst.rsp import get_node, RSPDiscovery
 
 __all__ = [
     "Benchmarker",
@@ -47,32 +44,38 @@ __all__ = [
 ]
 
 ########################## JSON typing #############################
-type J = dict[str,"J"] | list["J"] | str | int | float | bool | None
+type J = dict[str, "J"] | list["J"] | str | int | float | bool | None
+
 
 def strip_null(seq: Sequence) -> Sequence:
     return [x for x in seq if x is not None]
 
+
 ################### Data types for speed testing ###################
-_T = TypeVar('_T')
+_T = TypeVar("_T")
+
 
 class Generation(StrEnum):
     """Whether a measurement is the initial fetch or an immediate followup."""
+
     INITIAL = "initial"
     RECHECK = "recheck"
 
+
 class Location(StrEnum):
     """Whether dataset is located at USDF or Google."""
-    GOOGLE = "Google",
+
+    GOOGLE = ("Google",)
     USDF = "USDF"
+
 
 class ResultMapItem(BaseModel):
     """Results for a single HTTP request."""
 
     model_config = ConfigDict(
-        ser_json_temporal="seconds",
-        val_temporal_unit="seconds"
+        ser_json_temporal="seconds", val_temporal_unit="seconds"
     )
-    
+
     url: str
     size: int = 0
     start_time: datetime.datetime | None = None
@@ -86,21 +89,21 @@ class ResultMapItem(BaseModel):
     count: int | None = None
     limit: int | None = None
     butler_config: str | None = None
-    butler_collections: str | None = None  
+    butler_collections: str | None = None
     display_name: str | None = None
     dataset_name: str | None = None
     measurement_number: int | None = None
     debug: bool = False
 
     @property
-    def elapsed_time(self) -> datetime.timedelta|None:
+    def elapsed_time(self) -> datetime.timedelta | None:
         """Elapsed time (wallclock) around a single measurement."""
         if not self.end_time:
             return None
         return self.end_time - self.start_time
-    
+
     @property
-    def ratio(self) -> float|None:
+    def ratio(self) -> float | None:
         """Ratio of reported (by ``curl``) speed to measured speed."""
         if not self.speed_measured:
             return None
@@ -108,8 +111,9 @@ class ResultMapItem(BaseModel):
             return None
         return self.speed_reported / self.speed_measured
 
-SASQUATCH_NS="lsst.benchmark"
-SASQUATCH_DB="wekas3"
+
+SASQUATCH_NS = "lsst.benchmark"
+SASQUATCH_DB = "wekas3"
 
 _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
     "namespace": SASQUATCH_NS,
@@ -138,7 +142,7 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
         },
         {
             "name": "speed_measured",
-            "type":  "double",
+            "type": "double",
         },
         {
             "name": "node",
@@ -164,7 +168,7 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
         },
         {
             "name": "limit",
-            "type":  "long",
+            "type": "long",
         },
         {
             "name": "butler_config",
@@ -184,18 +188,16 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
         },
         {
             "name": "measurement_number",
-            "type":  "long",
+            "type": "long",
         },
-        {
-            "name": "debug",
-            "type": "boolean",
-            "default": False
-        },
-    ]
+        {"name": "debug", "type": "boolean", "default": False},
+    ],
 }
+
 
 class Statistics(BaseModel):
     """Statistics for a particular list of values."""
+
     CV: float | None = None
     mean: float | None = None
     median: float | None = None
@@ -203,25 +205,17 @@ class Statistics(BaseModel):
     pstdev: float | None = None
 
     @classmethod
-    def from_list(cls, all_values: list[float|int|None]) -> Self:
+    def from_list(cls, all_values: list[float | int | None]) -> Self:
         """Calculate statistics from a list of numbers."""
         if not all_values:
             return cls(
-                CV=None,
-                mean=None,
-                median=None,
-                pvariance=None,
-                pstdev=None
+                CV=None, mean=None, median=None, pvariance=None, pstdev=None
             )
-        nums = [ x for x in all_values if x is not None ]
+        nums = [x for x in all_values if x is not None]
         if not nums:
             return cls(
-                CV=None,
-                mean=None,
-                median=None,
-                pvariance=None,
-                pstdev=None
-            )            
+                CV=None, mean=None, median=None, pvariance=None, pstdev=None
+            )
         mean = statistics.mean(nums)
         pstdev = statistics.pstdev(nums)
         cv = pstdev / mean if mean else None
@@ -230,39 +224,44 @@ class Statistics(BaseModel):
             median=statistics.median(nums),
             pvariance=statistics.pvariance(nums),
             pstdev=pstdev,
-            CV=cv
+            CV=cv,
         )
+
 
 class ResultStatistics(BaseModel):
     """Container class for statistics on measurement series."""
+
     reported: Statistics
     measured: Statistics
     size: Statistics
     reported_measured_ratio: Statistics
     elapsed_time: Statistics
 
-type TimeSeries = dict[datetime,float|int]
+
+type TimeSeries = dict[datetime, float | int]
 """Mapping of instant to a numeric value at that time."""
+
 
 class SpeedType(StrEnum):
     """Whether a speed is reported by ``curl`` or measured by elapsed time."""
+
     MEASURED = "measured"
     REPORTED = "reported"
 
-class DumperUserList(UserList):
 
-    def model_dump(self) -> list[dict[str,Any]]:
-        return [ x.model_dump() for x in self.data ]
-    
+class DumperUserList(UserList):
+    def model_dump(self) -> list[dict[str, Any]]:
+        return [x.model_dump() for x in self.data]
+
     def model_dump_json(self) -> str:
-        return json.dumps([ json.loads(x.model_dump_json())
-                            for x in self.data ])
+        return json.dumps([json.loads(x.model_dump_json()) for x in self.data])
+
 
 class ResultMapItemList(DumperUserList[_T]):
     """List of measurements with some additional methods."""
+
     def __init__(self, iterable: Sequence[ResultMapItem]):
         super().__init__(item for item in iterable)
-
 
     # Pydantic magic
     @classmethod
@@ -278,7 +277,7 @@ class ResultMapItemList(DumperUserList[_T]):
         * serialization will always return just a list.
         """
 
-        def validate_from_list(values: list[ResultMapItem|J]) -> Self:
+        def validate_from_list(values: list[ResultMapItem | J]) -> Self:
             reval = ResultMapItemList([])
             for item in values:
                 if type(item) is ResultMapItem:
@@ -290,11 +289,12 @@ class ResultMapItemList(DumperUserList[_T]):
         from_list_schema = core_schema.chain_schema(
             [
                 core_schema.list_schema(),
-                core_schema.no_info_plain_validator_function(validate_from_list),
+                core_schema.no_info_plain_validator_function(
+                    validate_from_list
+                ),
             ]
         )
 
-        
         return core_schema.json_or_python_schema(
             json_schema=from_list_schema,
             python_schema=core_schema.union_schema(
@@ -305,11 +305,12 @@ class ResultMapItemList(DumperUserList[_T]):
                 ]
             ),
             serialization=core_schema.plain_serializer_function_ser_schema(
-                lambda instance: [ResultMapItem.model_validate(x) for x
-                    in instance.data]
+                lambda instance: [
+                    ResultMapItem.model_validate(x) for x in instance.data
+                ]
             ),
         )
-    
+
     @property
     def urls(self) -> list[str]:
         """Return urls fetched for measurements."""
@@ -321,27 +322,27 @@ class ResultMapItemList(DumperUserList[_T]):
         return [x.size for x in self.data]
 
     @property
-    def start_times(self) -> list[datetime.datetime|None]:
+    def start_times(self) -> list[datetime.datetime | None]:
         """Return measurement start times."""
         return [x.start_time for x in self.data]
 
     @property
-    def end_times(self) -> list[datetime.datetime|None]:
+    def end_times(self) -> list[datetime.datetime | None]:
         """Return measurement end times."""
         return [x.end_time for x in self.data]
 
     @property
-    def elapsed_times(self) -> list[datetime.timedelta|None]:
+    def elapsed_times(self) -> list[datetime.timedelta | None]:
         """Return elapsed times of measurement."""
         return [x.elapsed_time for x in self.data]
-        
+
     @property
-    def speeds_measured(self) -> list[float|None]:
+    def speeds_measured(self) -> list[float | None]:
         """Return speeds as measured by elapsed time."""
         return [x.speed_measured for x in self.data]
 
     @property
-    def speeds_reported(self) -> list[float|None]:
+    def speeds_reported(self) -> list[float | None]:
         """Return speeds as reported by ``curl``."""
         return [x.speed_reported for x in self.data]
 
@@ -361,7 +362,7 @@ class ResultMapItemList(DumperUserList[_T]):
         return self._speed_deltas(SpeedType.MEASURED)
 
     def _speed_deltas(self, speed_type: SpeedType) -> TimeSeries:
-        attr="speed_" + speed_type
+        attr = "speed_" + speed_type
         deltas = {}
         for item in self.data:
             value = getattr(item, attr)
@@ -374,10 +375,7 @@ class ResultMapItemList(DumperUserList[_T]):
                 initial_down = deltas.get(item.end_time, 0)
                 deltas[item.end_time] = initial_down - value
         return {
-            k: v for k, v in sorted(
-                deltas.items(),
-                key=lambda item: item[0]
-            )
+            k: v for k, v in sorted(deltas.items(), key=lambda item: item[0])
         }
 
     @property
@@ -389,18 +387,18 @@ class ResultMapItemList(DumperUserList[_T]):
     def aggregate_speeds_reported(self) -> TimeSeries:
         """Return list of all reported speeds-at-an-instant."""
         return self._aggregate_speeds(SpeedType.REPORTED)
-    
-    @property    
+
+    @property
     def aggregate_speeds_measured(self) -> TimeSeries:
         """Return list of all measured speeds-at-an-instant."""
         return self._aggregate_speeds(SpeedType.MEASURED)
 
-    def _aggregate_speeds(self, speed_type:SpeedType) -> TimeSeries:
+    def _aggregate_speeds(self, speed_type: SpeedType) -> TimeSeries:
         total_speed = 0
         propname = "speed_deltas_" + speed_type
         delta_series = getattr(self, propname)
-        speed_series:TimeSeries = {}
-        for k,v in delta_series.items():
+        speed_series: TimeSeries = {}
+        for k, v in delta_series.items():
             total_speed += v
             speed_series[k] = total_speed
         return speed_series
@@ -409,7 +407,7 @@ class ResultMapItemList(DumperUserList[_T]):
     def aggregate_bytes(self) -> TimeSeries:
         """Return list of total bytes transferred up to each event."""
         retval: TimeSeries = {}
-        events=sorted(self.data, key = lambda x: x.end_time)
+        events = sorted(self.data, key=lambda x: x.end_time)
         total_bytes = 0
         for ev in events:
             if ev.end_time is None:
@@ -425,7 +423,7 @@ class ResultMapItemList(DumperUserList[_T]):
         return bt[-1] if bt else 0
 
     @property
-    def total_elapsed_time(self) -> datetime.timedelta|None:
+    def total_elapsed_time(self) -> datetime.timedelta | None:
         """Return total time taken by the measurement series."""
         if not self.events or len(self.events) < 2:
             return None
@@ -436,9 +434,11 @@ class ResultMapItemList(DumperUserList[_T]):
         """Return average speed as total bytes transferred over all time."""
         total_elapsed = self.total_elapsed_time
         return (
-            self.total_bytes/total_elapsed.total_seconds()
-        ) if total_elapsed else None
-        
+            (self.total_bytes / total_elapsed.total_seconds())
+            if total_elapsed
+            else None
+        )
+
     @property
     def statistics(self) -> None:
         """Statistics for HTTP fetch speed, size, and times."""
@@ -448,10 +448,14 @@ class ResultMapItemList(DumperUserList[_T]):
             size=Statistics.from_list(self.sizes),
             reported_measured_ratio=Statistics.from_list(self.speeds_ratio),
             elapsed_time=Statistics.from_list(
-                [x.total_seconds() for x in self.elapsed_times
-                if x is not None]
-            )
+                [
+                    x.total_seconds()
+                    for x in self.elapsed_times
+                    if x is not None
+                ]
+            ),
         )
+
 
 class ResultMap(BaseModel):
     """Results for a particular dataset."""
@@ -459,9 +463,9 @@ class ResultMap(BaseModel):
     # model_config = ConfigDict(
     #    arbitrary_types_allowed=True
     # )
-    
+
     butler_config: str
-    butler_collections: str           
+    butler_collections: str
     display_name: str
     dataset_name: str
     node: str | None = None
@@ -492,19 +496,19 @@ class ResultMap(BaseModel):
     def speeds_ratio(self) -> list[float]:
         """Return ratios of reported to measured speeds."""
         return self.result_items.speeds_ratio
-        
+
     @property
-    def start_times(self) -> list[datetime.datetime|None]:
+    def start_times(self) -> list[datetime.datetime | None]:
         """Return measurement start times."""
         return self.result_items.start_times
 
     @property
-    def end_times(self) -> list[datetime.datetime|None]:
+    def end_times(self) -> list[datetime.datetime | None]:
         """Return measurement end times."""
         return self.result_items.end_times
 
     @property
-    def elapsed_times(self) -> list[datetime.timedelta|None]:
+    def elapsed_times(self) -> list[datetime.timedelta | None]:
         """Return elapsed times of measurement."""
         return self.result_items.elapsed_times
 
@@ -537,8 +541,8 @@ class ResultMap(BaseModel):
     def aggregate_speeds_reported(self) -> TimeSeries:
         """Return list of all reported speeds-at-an-instant."""
         return self.result_items.aggregate_speeds_reported
-    
-    @property    
+
+    @property
     def aggregate_speeds_measured(self) -> TimeSeries:
         """Return list of all measured speeds-at-an-instant."""
         return self.result_items.aggregate_speeds_measured
@@ -563,16 +567,20 @@ class ResultMap(BaseModel):
         """Return average speed as total bytes transferred over all time."""
         return self.result_items.average_speed
 
+
 class ResultMapList(DumperUserList[_T]):
     """A list of ResultMaps, possibly with some special features."""
+
     def __init__(self, iterable: Sequence[ResultMap]):
-        super().__init__(item for item in iterable)    
+        super().__init__(item for item in iterable)
+
 
 class RatioContainer(BaseModel):
     """This always holds at least one series of data.  It may hold two;
     we use this to resample a given set of URLs to investigate caching behavior."""
+
     butler_config: str
-    butler_collections: str           
+    butler_collections: str
     display_name: str
     dataset_name: str
     count: int
@@ -597,9 +605,9 @@ class RatioContainer(BaseModel):
             m_ratios.append(r_itm.speed_measured / i_itm.speed_measured)
             r_ratios.append(r_itm.speed_reported / i_itm.speed_reported)
         if m_ratios:
-            self.ratios_measured=m_ratios
+            self.ratios_measured = m_ratios
         if r_ratios:
-            self.ratios_reported=r_ratios
+            self.ratios_reported = r_ratios
 
     @property
     def ratio_statistics_measured(self) -> Statistics | None:
@@ -653,8 +661,10 @@ class RatioContainer(BaseModel):
             rit.url = iit.url  # Copy, not reference
             rit.size = iit.size
 
+
 class RatioContainerList(DumperUserList[_T]):
     """A list of RatioContainers, possibly with some special properties."""
+
     def __init__(self, iterable: Sequence[RatioContainer]):
         super().__init__(item for item in iterable)
 
@@ -665,7 +675,9 @@ class RatioContainerList(DumperUserList[_T]):
             retval.extend(list(ratc.measurements))
         return retval
 
+
 # Configuration object class
+
 
 class Dataset(BaseModel):
     """Object to characterize source of benchmark data.
@@ -691,32 +703,39 @@ class Dataset(BaseModel):
     debug
         Whether to enable debugging output.
     """
+
     butler_config: str
     butler_collections: str
     display_name: str
     dataset_name: str
-    count:int = 0
-    limit:int = 10000
-    location:Location | None = None
-    concurrency:int | None = None
-    recheck:bool = True
-    debug:bool = False
+    count: int = 0
+    limit: int = 10000
+    location: Location | None = None
+    concurrency: int | None = None
+    recheck: bool = True
+    debug: bool = False
+
 
 class DatasetList(UserList[_T]):
     """Container for Datasets."""
+
     def __init__(self, iterable: Sequence[ResultMap]):
         super().__init__(item for item in iterable)
-        
+
+
 ################### End of data types for speed testing ###################
-    
+
 #### Private utility functions
+
 
 def _now() -> datetime.datetime:
     return datetime.datetime.now(tz=datetime.UTC)
 
+
 def _cpus() -> int:
     lim = os.getenv("CPU_LIMIT", "1")  # RSP-specific
     return int(lim)
+
 
 def _get_curl() -> str:
     """Return path to ``curl`` executable."""
@@ -725,11 +744,13 @@ def _get_curl() -> str:
         raise RuntimeError("'curl' must be on path")
     return curl
 
+
 def _get_user() -> str:
     return os.environ["USER"]
 
+
 def _have_results_check_result_map_items(
-    initial: ResultMapItem, recheck:ResultMapItem, idx=int
+    initial: ResultMapItem, recheck: ResultMapItem, idx=int
 ) -> None:
     _sanity_check_result_map_items(initial, recheck, idx)
     iid = f"item #{idx} '{initial.url}'"
@@ -739,31 +760,29 @@ def _have_results_check_result_map_items(
         else:
             vitem = recheck
         for spname in ("speed_measured", "speed_reported"):
-            vval=getattr(vitem,spname)
+            vval = getattr(vitem, spname)
             if not vval:
-                raise ValueError(
-                   f"{itname} {iid} field {spname} is not set"
-                )
+                raise ValueError(f"{itname} {iid} field {spname} is not set")
+
 
 def _sanity_check_result_map_items(
-    initial: ResultMapItem, recheck:ResultMapItem, idx=int
+    initial: ResultMapItem, recheck: ResultMapItem, idx=int
 ) -> None:
-        # Sanity-check the data point
-        i_url = initial.url
-        r_url = recheck.url
-        i_sz = initial.size
-        r_sz = recheck.size
-        iid = f"initial item #{idx} '{i_url}'"
-        if r_url != i_url:
-            raise ValueError(
-                f"URL for {iid}"
-                f" does not match recheck item '{r_url}'"
-            )
-        if r_sz != i_sz:
-            raise ValueError(
-                f"Size {i_sz} for {iid}"
-                f" does not match recheck size {r_sz}"
-            )
+    # Sanity-check the data point
+    i_url = initial.url
+    r_url = recheck.url
+    i_sz = initial.size
+    r_sz = recheck.size
+    iid = f"initial item #{idx} '{i_url}'"
+    if r_url != i_url:
+        raise ValueError(
+            f"URL for {iid} does not match recheck item '{r_url}'"
+        )
+    if r_sz != i_sz:
+        raise ValueError(
+            f"Size {i_sz} for {iid} does not match recheck size {r_sz}"
+        )
+
 
 def _t_to_spd(t_spd: str) -> float:
     # Convert speed in suffixed units to integer.
@@ -777,6 +796,7 @@ def _t_to_spd(t_spd: str) -> float:
         return float(t_spd[:-1]) * kilo
     else:
         return float(t_spd)
+
 
 @dataclass
 class _extracted_from_filename:
@@ -802,8 +822,9 @@ class _extracted_from_filename:
             collections=coll,
             datestamp=datestamp,
             node=node,
-            user=user
+            user=user,
         )
+
 
 def _update_ratio_container_schema(obj: J, filename: Path) -> RatioContainer:
     xt = _extracted_from_filename.extract(filename)
@@ -813,20 +834,21 @@ def _update_ratio_container_schema(obj: J, filename: Path) -> RatioContainer:
     }
     for k, v in updated.items():
         if k not in obj:
-            obj[k]=v
+            obj[k] = v
             obj["initial"][k] = v
             if obj["recheck"]:
                 obj["recheck"][k] = v
     return RatioContainer.model_validate(obj)
-    
+
 
 #### Functions for concurrency management
 
 ## Very loose typing.
-type ConcurrentMethod = Callable[[Benchmark,_ItemPairHelper], Any]
+type ConcurrentMethod = Callable[[Benchmarker, _ItemPairHelper], Any]
 """A method suitable for running via semaphore and task group."""
 
 type _SizeCache = dict[str, int]
+
 
 @dataclass
 class _SpeedHelper:
@@ -834,24 +856,27 @@ class _SpeedHelper:
     end_time: datetime.datetime
     reported_speed: str
 
+
 @dataclass
 class _ItemPairHelper:
-    index: int
-    count: int
+    count: int | None
     initial_item: ResultMapItem
-    recheck_item: ResultMapItem|None
-    measurement_number: int|None
+    recheck_item: ResultMapItem | None
+    measurement_number: int | None
+
 
 @dataclass
 class _ClientHelper:
     client: httpx.AsyncClient
     token: str
 
+
 #### Public function
+
 
 def load_results_from_json(filename: Path) -> RatioContainerList:
     """Read results from a persisted JSON file.
-    
+
     Parameters
     ----------
     filename
@@ -868,15 +893,17 @@ def load_results_from_json(filename: Path) -> RatioContainerList:
         try:
             pyd_obj = RatioContainer.model_validate(obj)
         except ValidationError:
-            pyd_obj=_update_ratio_container_schema(obj, filename)
+            pyd_obj = _update_ratio_container_schema(obj, filename)
         res.append(pyd_obj)
     return res
-    
+
+
 #### Speed Tester class
+
 
 class Benchmarker:
     """This object samples Butler signed URLs and determines their fetch speed.
-    
+
     Parameters
     ----------
     dataset_list
@@ -890,12 +917,12 @@ class Benchmarker:
     sasquatch_url
         Sasquatch URL to receive data, or None (defaults to None).
     """
-        
+
     def __init__(
         self,
         dataset_list: DatasetList,
-        output_dir: Path|None = None,
-        concurrency: int|None = None,
+        output_dir: Path | None = None,
+        concurrency: int | None = None,
         debug: bool = False,
         send_to_sasquatch: bool = False,
     ) -> None:
@@ -919,78 +946,69 @@ class Benchmarker:
 
     def _get_cfg_and_coll(self) -> tuple[str]:
         cfg = "+".join(list(set([x.butler_config for x in self._dslist])))
-        coll = "+".join(list(set([x.butler_collections 
-                                  for x in self._dslist])))
-        return (cfg,coll)
-    
+        coll = "+".join(
+            list(set([x.butler_collections for x in self._dslist]))
+        )
+        return (cfg, coll)
+
     def _setup_logging(self) -> None:
         rootlgr = logging.getLogger()
         # Get rid of root logger handlers
         for hdl in rootlgr.handlers:
             rootlgr.removeHandler(hdl)
         # Create new logger
-        lgr = logging.getLogger('Weka_Benchmarker')
+        lgr = logging.getLogger("Weka_Benchmarker")
         level = logging.DEBUG if self._debug else logging.WARNING
         lgr.setLevel(level)
-        fmt = '[%(levelname)s] %(asctime)s: %(message)s'
         for hdl in lgr.handlers:
             lgr.removeHandler(hdl)
         handler = logging.StreamHandler(stream=sys.stdout)
         lgr.addHandler(handler)
         lgr.debug("Logging initialized.")
         self._logger = lgr
-        
-    def _setup_result_path(self, datadir:Path) -> Path:
+
+    def _setup_result_path(self, datadir: Path) -> Path:
         """Return path to JSON file holding results."""
         nnow = _now()
         # build the name
-        of_name = f"weka-gateway"
+        of_name = "weka-gateway"
         of_name += f"-{self._cfg}-{self._coll}"
         of_name += f"-{nnow.year}.{nnow.month:02d}.{nnow.day:02d}"
         of_name += f".{nnow.hour:02d}.{nnow.minute:02d}.{nnow.second:02d}"
         of_name += f"-{self._node}"
         of_name += f"-{_get_user()}.json"
         return datadir / of_name
-    
-    async def _get_sasquatch_client(self) -> _ClientHelper|None:
+
+    async def _get_sasquatch_client(self) -> _ClientHelper | None:
         """Acquire a sasquatch client, if we can."""
-        token=RSPDiscovery.get_token()
-        wrn="; will not report to Sasquatch."
+        token = RSPDiscovery.get_token()
+        wrn = "; will not report to Sasquatch."
         if not token:
-            self._logger.warning(
-                f"Could not acquire access token{wrn}"
-            )
+            self._logger.warning(f"Could not acquire access token{wrn}")
             return None
         # It doesn't look like lsst.rsp gives us a way to get internal services.
         # We also don't have rubin.repertoire available in the environment.
-        inst_url=os.getenv("EXTERNAL_INSTANCE_URL", None)
+        inst_url = os.getenv("EXTERNAL_INSTANCE_URL", None)
         if not inst_url:
-            self._logger.warning(
-                f"Could not determine RSP instance URL{wrn}"
-            )
+            self._logger.warning(f"Could not determine RSP instance URL{wrn}")
             return None
         client = httpx.AsyncClient(
             headers={
                 "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             },
             follow_redirects=True,
         )
         resp = await client.get(f"{inst_url}/auth/api/v1/token-info")
         resp.raise_for_status()
         obj = resp.json()
-        scopes = obj.get("scopes",[])
+        scopes = obj.get("scopes", [])
         if "write:sasquatch" not in scopes:
-            self._logger.warning(
-                f"'write:sasquatch' not in scopes {scopes}"
-            )
+            self._logger.warning(f"'write:sasquatch' not in scopes {scopes}")
             return None
         base_url = f"{inst_url}/sasquatch-rest-proxy"
         client.base_url = base_url
-        return _ClientHelper(
-            client=client,
-            token=token
-        )
+        return _ClientHelper(client=client, token=token)
 
     async def _configure_topic(self, client: httpx.AsyncClient) -> None:
         """Configure Kafka topic."""
@@ -1003,13 +1021,12 @@ class Benchmarker:
         obj = resp.json()
         cluster_id = obj["data"][0]["cluster_id"]
         topic_config = {
-            "topic_name": ".".join([SASQUATCH_NS,SASQUATCH_DB]),
+            "topic_name": ".".join([SASQUATCH_NS, SASQUATCH_DB]),
             "partitions_count": 1,
-            "replication_factor": 3
+            "replication_factor": 3,
         }
         resp = await client.post(
-            f"/v3/clusters/{cluster_id}/topics",
-            json=topic_config
+            f"/v3/clusters/{cluster_id}/topics", json=topic_config
         )
         if resp.status_code == 400 and "already exists" in resp.text:
             pass
@@ -1026,17 +1043,16 @@ class Benchmarker:
     def _assemble_measurements(self, res: RatioContainerList) -> list[J]:
         """Create a list of JSONable representations of all ResultMapItems."""
         # Roundtripping through the JSON dumper to convert datetime
-        jsonable = [ json.loads(m.model_dump_json()) 
-                     for m in res.measurements ]
+        jsonable = [json.loads(m.model_dump_json()) for m in res.measurements]
         for meas in jsonable:
             meas["timestamp"] = meas["start_time"]
         return jsonable
 
-    def _get_failure_logstr(self, payload:J) -> str:
+    def _get_failure_logstr(self, payload: J) -> str:
         """Create a pretty-printed string for logging failure."""
         schema = json.loads(payload["value_schema"])
         first_record = payload["records"][0]["value"]
-        return(
+        return (
             "Failure sending to sasquatch:\n"
             "----------\n"
             "schema:\n"
@@ -1046,7 +1062,7 @@ class Benchmarker:
             f"{json.dumps(first_record, indent=2)}\n"
             "----------"
         )
-    
+
     async def _send_results_to_sasquatch(
         self,
         res: RatioContainerList,
@@ -1065,12 +1081,10 @@ class Benchmarker:
         # await self._configure_topic(client)
         meas = self._assemble_measurements(res)
         # Put together the Avro schema definition and the measurements.
-        records = [ { "value": m } for m in meas ]
+        records = [{"value": m} for m in meas]
         payload = {
-            "value_schema": json.dumps(
-                _RESULT_MAP_ITEM_SASQUATCH_SCHEMA
-            ),
-            "records": records
+            "value_schema": json.dumps(_RESULT_MAP_ITEM_SASQUATCH_SCHEMA),
+            "records": records,
         }
         # Don't think we need to add Authorization here; I think these
         # are additive and that the headers on the post() override those
@@ -1082,19 +1096,19 @@ class Benchmarker:
             "Authorization": f"Bearer {token}",
         }
         resp = await client.post(
-            f"/topics/{'.'.join([SASQUATCH_NS,SASQUATCH_DB])}",
+            f"/topics/{'.'.join([SASQUATCH_NS, SASQUATCH_DB])}",
             json=payload,
-            headers=headers
+            headers=headers,
         )
         await client.aclose()
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError:
             self._logger.exception(
-            "Sasquatch REST Proxy returned %s: %s",
-            resp.status_code,
-            resp.text,
-        )
+                "Sasquatch REST Proxy returned %s: %s",
+                resp.status_code,
+                resp.text,
+            )
         self._logger.debug(
             f"Measurements sent to Sasquatch at {client.base_url}"
         )
@@ -1105,7 +1119,7 @@ class Benchmarker:
         self,
         sema: asyncio.Semaphore,
         meth: ConcurrentMethod,
-        item: _ItemPairHelper
+        item: _ItemPairHelper,
     ) -> None:
         async with sema:
             await meth(item)
@@ -1123,15 +1137,11 @@ class Benchmarker:
 
     ## The '_find' methods retrieve data via HTTP.
 
-    async def _find_size_for_item(
-        self,
-        itempair: _ItemPairHelper
-    ) -> int:
+    async def _find_size_for_item(self, itempair: _ItemPairHelper) -> int:
         """Return size of HTTP-accessible object.
         The HEAD method is blocked, but a byte range will work."""
         size_cache = self._size_cache
         curl = self._curl
-        idx = itempair.index
         count = itempair.count
         measurement_number = itempair.measurement_number
         url = itempair.initial_item.url
@@ -1139,14 +1149,21 @@ class Benchmarker:
             sz = size_cache[url]
             self.logger.debug(f"URL '{url}' found in size cache: {sz}")
             return sz
-        self._logger.debug(f"Finding size for item {idx+1}/{count}")
+        self._logger.debug(
+            f"Finding size for item{measurement_number}/{count}"
+        )
         proc = await asyncio.create_subprocess_exec(
-            curl, url, "-v", "-r", "0-0", "-o" "/dev/null",
+            curl,
+            url,
+            "-v",
+            "-r",
+            "0-0",
+            "-o/dev/null",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
-        if proc.returncode !=0:
+        if proc.returncode != 0:
             raise RuntimeError(
                 f"Getting object size for '{url}' failed"
                 f" rc={proc.returncode},"
@@ -1157,33 +1174,29 @@ class Benchmarker:
         # find the content-range header.
         # The total size is after the slash.
         sz = int(
-            [x for x in s_errl
-                if x.startswith("< content-range:")
-            ][0].split("/")[-1]
+            [x for x in s_errl if x.startswith("< content-range:")][0].split(
+                "/"
+            )[-1]
         )
-        size_cache[url]=sz
+        size_cache[url] = sz
         itempair.initial_item.size = sz
-        self._logger.debug(f"...{idx+1}/{count}: {sz}B")
+        self._logger.debug(f"...{measurement_number}/{count}: {sz}B")
         return sz
 
     async def _find_speed_pair(
         self,
         itempair: _ItemPairHelper,
     ) -> None:
-        itemstr=f"item {itempair.index+1}/{itempair.count}"
-        spdstr=f"speed for {itemstr}"
-        self._logger.debug(
-            f"Finding initial {spdstr}"
-        )
+        itemstr = f"item {itempair.measurement_number}/{itempair.count}"
+        spdstr = f"speed for {itemstr}"
+        self._logger.debug(f"Finding initial {spdstr}")
         await self._determine_speed_for_item(
             itempair.initial_item,
             itemstr,
             itempair.measurement_number,
         )
         if itempair.recheck_item:
-            self._logger.debug(
-                f"Finding recheck {spdstr}"
-            )
+            self._logger.debug(f"Finding recheck {spdstr}")
             # This is sequential to allow caching to happen.  Two pulls
             # of the same URL, one after the other.  Different URLs
             # can happen concurrently.
@@ -1196,13 +1209,10 @@ class Benchmarker:
     ## Further helper methods for getting speed.
 
     async def _determine_speed_for_item(
-        self,
-        item: ResultMapItem,
-        itemstr: str,
-        measurement_number: int
-    )-> None:
+        self, item: ResultMapItem, itemstr: str, measurement_number: int
+    ) -> None:
         """Updates result map item in place with HTTP fetch speed.
-        
+
         Inserts reported speed, and calculates measured speed and
         ratio of reported to measured speeds.
         """
@@ -1219,27 +1229,29 @@ class Benchmarker:
             f"{itemstr}:"
             f" reported {speed_reported:.02f} bytes/s;"
             f" measured {speed_measured:.02f} bytes/s;"
-            f" ratio (r/m) {speed_reported/speed_measured:.03f}"
+            f" ratio (r/m) {speed_reported / speed_measured:.03f}"
         )
 
-    async def _fetch_item(
-        self,
-        url: str
-    ) -> _SpeedHelper:
+    async def _fetch_item(self, url: str) -> _SpeedHelper:
         """Get speed of transfer.
 
         If we're slower than 50kB/s for 30 seconds, abort.  That will break
         the run, because we won't have all the samples we expect, so no point
         in catching a bad conversion."""
-        curl=self._curl
+        curl = self._curl
         # If we're slower than 50kB/s for 30 seconds, abort.
         # That will break the run, since we will have None for some of
         # our sample values (the tasks will throw exceptions and
         # not update their speed fields).
         proc = await asyncio.create_subprocess_exec(
-            curl, url, "-Y", "50000", "-o", "/dev/null",
+            curl,
+            url,
+            "-Y",
+            "50000",
+            "-o",
+            "/dev/null",
             stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         # Reported speed ought to be slightly higher than
         # measured speed, because measured speed includes the overhead
@@ -1256,21 +1268,17 @@ class Benchmarker:
         st = _now()
         stdout, stderr = await proc.communicate()
         et = _now()
-        if proc.returncode !=0:
+        if proc.returncode != 0:
             raise RuntimeError(
-                f"Getting fetch speed for '{item.url}' failed"
+                f"Getting fetch speed for '{url}' failed"
                 f" rc={proc.returncode},"
                 f" stdout='{stdout}',"
                 f" stderr='{stderr}'"
             )
         # Last field is speed (string, suffixed with binary units).
         r_spd = stderr.decode().strip().split()[-1]
-        return _SpeedHelper(
-            start_time=st,
-            end_time=et,
-            reported_speed=r_spd
-        )
-    
+        return _SpeedHelper(start_time=st, end_time=et, reported_speed=r_spd)
+
     def _build_results(self) -> RatioContainerList:
         """From a list of parameters for a given Butler config and
         collections, create a random sample of URLs to benchmark
@@ -1279,8 +1287,7 @@ class Benchmarker:
         results: RatioContainerList = RatioContainerList([])
         for ds in self._dslist:
             butler = Butler(
-                ds.butler_config,
-                collections=ds.butler_collections
+                ds.butler_config, collections=ds.butler_collections
             )
             name = ds.display_name
             dsname = ds.dataset_name
@@ -1293,7 +1300,7 @@ class Benchmarker:
             node = self._node
             location = ds.location
             debug = self._debug
-            if ((count <= 0) or (limit <= 0)):
+            if (count <= 0) or (limit <= 0):
                 continue
             initial_result_map = ResultMap(
                 butler_config=cfg,
@@ -1307,19 +1314,23 @@ class Benchmarker:
                 node=node,
                 location=location,
             )
-            recheck_result_map = ResultMap(
-                butler_config=ds.butler_config,
-                butler_collections=ds.butler_collections,
-                display_name=ds.display_name,
-                dataset_name=ds.dataset_name,
-                count=count,
-                limit=limit,
-                generation=Generation.RECHECK,
-                user=user,
-                node=node,
-                location=location,
-                debug=debug,
-            ) if ds.recheck else None
+            recheck_result_map = (
+                ResultMap(
+                    butler_config=ds.butler_config,
+                    butler_collections=ds.butler_collections,
+                    display_name=ds.display_name,
+                    dataset_name=ds.dataset_name,
+                    count=count,
+                    limit=limit,
+                    generation=Generation.RECHECK,
+                    user=user,
+                    node=node,
+                    location=location,
+                    debug=debug,
+                )
+                if ds.recheck
+                else None
+            )
             ratio_container = RatioContainer(
                 butler_config=cfg,
                 butler_collections=coll,
@@ -1340,12 +1351,14 @@ class Benchmarker:
                 f"sample {count} from {limit}..."
             )
             q_results = butler.query_datasets(
-                dsname, find_first=False, limit = limit
+                dsname, find_first=False, limit=limit
             )
             records = count if len(q_results) > count else len(q_results)
-            urls = [str(butler.getURI(x)) for x
-                    in random.sample(q_results, records)]
-            r_p = '' if recheck else 'out'
+            urls = [
+                str(butler.getURI(x))
+                for x in random.sample(q_results, records)
+            ]
+            r_p = "" if recheck else "out"
             self._logger.debug(
                 f"   ...sampled {records} records with{r_p} recheck"
             )
@@ -1365,7 +1378,8 @@ class Benchmarker:
                         generation=Generation.INITIAL,
                         location=location,
                         debug=debug,
-                    ))
+                    )
+                )
                 if recheck:
                     recheck_result_map.result_items.append(
                         ResultMapItem(
@@ -1381,24 +1395,21 @@ class Benchmarker:
                             generation=Generation.RECHECK,
                             location=location,
                             debug=debug,
-                        ))
+                        )
+                    )
         return results
-        
-    async def _get_all_sizes(
-        self, result_map: ResultMap
-    ) -> ResultMap:
+
+    async def _get_all_sizes(self, result_map: ResultMap) -> ResultMap:
         """Updates result_map in place with size of each HTTP object."""
-        dataset = result_map.display_name
-        count=len(result_map.result_items)
+        count = len(result_map.result_items)
         hlp: list[_ItemPairHelper] = []
         for idx, item in enumerate(result_map.result_items):
             hlp.append(
                 _ItemPairHelper(
-                    index=idx,
                     count=count,
                     initial_item=item,
                     recheck_item=None,
-                    measurement_number=idx+1
+                    measurement_number=idx + 1,
                 )
             )
         await self._concurrency_limiter(
@@ -1420,21 +1431,23 @@ class Benchmarker:
             i_rm = ratio_container.initial
             r_rm = ratio_container.recheck
             await self._get_all_sizes(i_rm)
-            if r_rm:        
+            if r_rm:
                 ratio_container._prepare_recheck_items()
                 ratio_container._validate_paired_resultmaps()
             count = len(i_rm.result_items)
             itempairs: list[_ItemPairHelper] = []
             for idx, i_item in enumerate(i_rm.result_items):
-                r_item = (ratio_container.recheck.result_items[idx]
-                          if ratio_container.recheck else None)
+                r_item = (
+                    ratio_container.recheck.result_items[idx]
+                    if ratio_container.recheck
+                    else None
+                )
                 itempairs.append(
                     _ItemPairHelper(
-                        index=idx,
                         count=count,
                         initial_item=i_item,
                         recheck_item=r_item,
-                        measurement_number=idx+1
+                        measurement_number=idx + 1,
                     )
                 )
             await self._concurrency_limiter(
