@@ -16,4 +16,3 @@ If you find yourself developing on `mobu`, you are doing it wrong.
 
 The reason the branches differ is that under `mobu`, cell execution happens by executing a (possibly very long) string representing a notebook's JSON.
 It has no concept of a checkout, or even, really, of the file it's executing, so it is necessary to put everything into a single notebook.
-
