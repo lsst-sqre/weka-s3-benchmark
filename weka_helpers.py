@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import random
-import shutil
 import statistics
 import sys
 from collections import UserList
@@ -17,11 +16,12 @@ from pathlib import Path
 from typing import Any, Self, TypeVar
 
 import httpx  # Already present in RSP
-from lsst.daf.butler import Butler
+from lsst.daf.butler import Butler, DatasetRef
 from lsst.rsp import RSPDiscovery, get_node
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     GetCoreSchemaHandler,
     ValidationError,
 )
@@ -72,10 +72,12 @@ class ResultMapItem(BaseModel):
     """Results for a single HTTP request."""
 
     model_config = ConfigDict(
-        ser_json_temporal="seconds", val_temporal_unit="seconds"
+        ser_json_temporal="seconds",
+        val_temporal_unit="seconds",
+        arbitrary_types_allowed=True,
     )
-
-    url: str
+    ds_ref: DatasetRef | None = Field(exclude=True, default=None)
+    url: str | None = None
     size: int = 0
     start_time: datetime.datetime | None = None
     end_time: datetime.datetime | None = None
@@ -103,7 +105,7 @@ class ResultMapItem(BaseModel):
 
     @property
     def ratio(self) -> float | None:
-        """Ratio of reported (by ``curl``) speed to measured speed."""
+        """Ratio of reported speed to measured speed."""
         if not self.speed_measured:
             return None
         if self.speed_reported is None:
@@ -242,7 +244,7 @@ type TimeSeries = dict[datetime, float | int]
 
 
 class SpeedType(StrEnum):
-    """Whether a speed is reported by ``curl`` or measured by elapsed time."""
+    """Whether a speed is reported or measured by elapsed time."""
 
     MEASURED = "measured"
     REPORTED = "reported"
@@ -342,7 +344,7 @@ class ResultMapItemList(DumperUserList[_T]):
 
     @property
     def speeds_reported(self) -> list[float | None]:
-        """Return speeds as reported by ``curl``."""
+        """Return reported speeds."""
         return [x.speed_reported for x in self.data]
 
     @property
@@ -736,14 +738,6 @@ def _cpus() -> int:
     return int(lim)
 
 
-def _get_curl() -> str:
-    """Return path to ``curl`` executable."""
-    curl = shutil.which("curl")
-    if not curl:
-        raise RuntimeError("'curl' must be on path")
-    return curl
-
-
 def _get_user() -> str:
     return os.environ["USER"]
 
@@ -781,20 +775,6 @@ def _sanity_check_result_map_items(
         raise ValueError(
             f"Size {i_sz} for {iid} does not match recheck size {r_sz}"
         )
-
-
-def _t_to_spd(t_spd: str) -> float:
-    # Convert speed in suffixed units to integer.
-    # This uses ``curl``'s conventions: SI abbreviations
-    # and binary sizes (e.g. 1k=1024, not 1000).
-    mega = 2 << 19
-    kilo = 2 << 9
-    if t_spd.endswith("M"):
-        return float(t_spd[:-1]) * mega
-    elif t_spd.endswith("k"):
-        return float(t_spd[:-1]) * kilo
-    else:
-        return float(t_spd)
 
 
 @dataclass
@@ -852,7 +832,7 @@ type _SizeCache = dict[str, int]
 class _SpeedHelper:
     start_time: datetime.datetime
     end_time: datetime.datetime
-    reported_speed: str
+    speed: float
 
 
 @dataclass
@@ -924,6 +904,8 @@ class Benchmarker:
         debug: bool = False,
         send_to_sasquatch: bool = False,
     ) -> None:
+        # Force butler cache off.
+        os.environ["DAF_BUTLER_CACHE_EXPIRATION_MODE"] = "disabled"
         self._dslist = dataset_list
         self._debug = debug
         if concurrency is None:
@@ -935,7 +917,6 @@ class Benchmarker:
         self._sasquatch_client: httpx.AsyncClient | None = None
         self._send_to_sasquatch = send_to_sasquatch
         self._node = get_node()
-        self._curl = _get_curl()
         self._setup_logging()
         output_dir = output_dir if output_dir else Path(".")
         self._result_path = self._setup_result_path(datadir=output_dir)
@@ -1136,47 +1117,36 @@ class Benchmarker:
         """Return size of HTTP-accessible object.
         The HEAD method is blocked, but a byte range will work."""
         size_cache = self._size_cache
-        curl = self._curl
         count = itempair.count
         measurement_number = itempair.measurement_number
         url = itempair.initial_item.url
+        if not url:
+            dsref = itempair.initial_item.ds_ref
+            if not dsref:
+                raise RuntimeError("No dataset reference for ResultMapItem")
+            butler = Butler(
+                itempair.initial_item.butler_config,
+                collections=itempair.initial_item.butler_collections,
+            )
+            if not butler:
+                raise RuntimeError(
+                    f"No butler for ResultMapItem '{dsref.id!s}'"
+                )
+            uri = butler.getURI(dsref)
+            url = str(uri)
+            itempair.initial_item.url = url
+            self._logger.debug(
+                f"Finding size for item {measurement_number}/{count}"
+            )
+            size = uri.size()
+            itempair.initial_item.size = size
+            size_cache[url] = size
+            return size
         if url in size_cache:
             sz = size_cache[url]
-            self.logger.debug(f"URL '{url}' found in size cache: {sz}")
+            self._logger.debug(f"URL '{url}' found in size cache: {sz}")
             return sz
-        self._logger.debug(
-            f"Finding size for item {measurement_number}/{count}"
-        )
-        proc = await asyncio.create_subprocess_exec(
-            curl,
-            url,
-            "-v",
-            "-r",
-            "0-0",
-            "-o/dev/null",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Getting object size for '{url}' failed"
-                f" rc={proc.returncode},"
-                f" stdout='{stdout}',"
-                f" stderr='{stderr}'"
-            )
-        s_errl = stderr.decode().split("\n")
-        # find the content-range header.
-        # The total size is after the slash.
-        sz = int(
-            next(x for x in s_errl if x.startswith("< content-range:")).split(
-                "/"
-            )[-1]
-        )
-        size_cache[url] = sz
-        itempair.initial_item.size = sz
-        self._logger.debug(f"...{measurement_number}/{count}: {sz}B")
-        return sz
+        raise RuntimeError(f"Could not determine size for {url}")
 
     async def _find_speed_pair(
         self,
@@ -1208,75 +1178,36 @@ class Benchmarker:
     ) -> None:
         """Updates result map item in place with HTTP fetch speed.
 
-        Inserts reported speed, and calculates measured speed and
-        ratio of reported to measured speeds.
+        Calculates measured speed; with butler.get() there is
+        no reported speed, so we set it to the same as measured.
         """
-        res = await self._fetch_item(item.url)
-        elapsed = res.end_time - res.start_time
-        speed_reported = _t_to_spd(res.reported_speed)
-        speed_measured = item.size / elapsed.total_seconds()
+        res = await self._fetch_item(item)
         item.start_time = res.start_time
         item.end_time = res.end_time
-        item.speed_reported = speed_reported
-        item.speed_measured = speed_measured
+        item.speed_reported = res.speed
+        item.speed_measured = res.speed
         item.measurement_number = measurement_number
-        self._logger.debug(
-            f"{itemstr}:"
-            f" reported {speed_reported:.02f} bytes/s;"
-            f" measured {speed_measured:.02f} bytes/s;"
-            f" ratio (r/m) {speed_reported / speed_measured:.03f}"
-        )
+        self._logger.debug(f"{itemstr}: speed {res.speed:.02f} bytes/s;")
 
-    async def _fetch_item(self, url: str) -> _SpeedHelper:
-        """Get speed of transfer.
-
-        If we're slower than 50kB/s for 30 seconds, abort.  That will break
-        the run, because we won't have all the samples we expect, so no point
-        in catching a bad conversion."""
-        curl = self._curl
-        # If we're slower than 50kB/s for 30 seconds, abort.
-        # That will break the run, since we will have None for some of
-        # our sample values (the tasks will throw exceptions and
-        # not update their speed fields).
-        proc = await asyncio.create_subprocess_exec(
-            curl,
-            url,
-            "-Y",
-            "50000",
-            "-o",
-            "/dev/null",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    async def _fetch_item(self, rm_item: ResultMapItem) -> _SpeedHelper:
+        """Get speed of transfer."""
+        if not rm_item.ds_ref:
+            raise RuntimeError(f"No DatasetRef for {rm_item.url}")
+        butler = Butler(
+            rm_item.butler_config, collections=rm_item.butler_collections
         )
-        # Reported speed ought to be slightly higher than
-        # measured speed, because measured speed includes the overhead
-        # of the curl process outside its fetch loop too.
-        #
-        # However, measured speed is much more granular, so the rounding
-        # inherent in reported speed might make it slightly slower.
-        # If reported speed varies outside the window of "slightly slower"
-        # to "somewhat faster" then....
-        #
-        # ...that's why we track it: we can scale-test and see if at some
-        # point, we have so many processes running that process thrashing
-        # is taking up a significant fraction of our (wall-clock) time.
         st = _now()
-        stdout, stderr = await proc.communicate()
+        _ = await asyncio.to_thread(butler.get, rm_item.ds_ref)
         et = _now()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Getting fetch speed for '{url}' failed"
-                f" rc={proc.returncode},"
-                f" stdout='{stdout}',"
-                f" stderr='{stderr}'"
-            )
-        # Last field is speed (string, suffixed with binary units).
-        r_spd = stderr.decode().strip().split()[-1]
-        return _SpeedHelper(start_time=st, end_time=et, reported_speed=r_spd)
+        del _
+        if et == st:
+            raise RuntimeError(f"{rm_item.url} fetched infinitely fast.")
+        speed = rm_item.size / ((et - st).total_seconds())
+        return _SpeedHelper(start_time=st, end_time=et, speed=speed)
 
     def _build_results(self) -> RatioContainerList:
         """From a list of parameters for a given Butler config and
-        collections, create a random sample of URLs to benchmark
+        collections, create a random sample of objects to benchmark
         (optionally rechecking for caching).
         """
         results: RatioContainerList = RatioContainerList([])
@@ -1349,19 +1280,16 @@ class Benchmarker:
                 dsname, find_first=False, limit=limit
             )
             records = min(len(q_results), count)
-            urls = [
-                str(butler.getURI(x))
-                for x in random.sample(q_results, records)
-            ]
+            c_results = random.sample(q_results, records)
             r_p = "" if recheck else "out"
             self._logger.debug(
                 f"   ...sampled {records} records with{r_p} recheck"
             )
             ratio_container.count = records
-            for url in urls:
+            for c_result in c_results:
                 initial_result_map.result_items.append(
                     ResultMapItem(
-                        url=url,
+                        ds_ref=c_result,
                         node=node,
                         user=user,
                         count=count,
@@ -1378,7 +1306,7 @@ class Benchmarker:
                 if recheck:
                     recheck_result_map.result_items.append(
                         ResultMapItem(
-                            url=url,
+                            ds_ref=c_result,
                             node=node,
                             user=user,
                             count=count,
