@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Self, TypeVar
+from uuid import uuid4
 
 import httpx  # Already present in RSP
 from lsst.daf.butler import Butler, DatasetRef
@@ -64,9 +65,26 @@ class Generation(StrEnum):
 class Location(StrEnum):
     """Whether dataset is located at USDF or Google."""
 
-    GOOGLE = ("Google",)
+    GOOGLE = "Google"
     USDF = "USDF"
 
+
+class Transport(StrEnum):
+    """What transport is used for data retrieval."""
+
+    BUTLER = "butler"
+    CURL_DISCARD = "curl:discard"
+    CURL_EPHEMERAL = "curl:ephemeral"
+    CURL_MEMORY = "curl:memory"
+    CURL_NFS = "curl:nfs"
+
+
+
+class SpeedType(StrEnum):
+    """Whether a speed is reported or measured by elapsed time."""
+
+    MEASURED = "measured"
+    REPORTED = "reported"
 
 class ResultMapItem(BaseModel):
     """Results for a single HTTP request."""
@@ -76,7 +94,8 @@ class ResultMapItem(BaseModel):
         val_temporal_unit="seconds",
         arbitrary_types_allowed=True,
     )
-    ds_ref: DatasetRef | None = Field(exclude=True, default=None)
+    id: str | None = None
+    run_id: str | None = None
     url: str | None = None
     size: int = 0
     start_time: datetime.datetime | None = None
@@ -87,6 +106,8 @@ class ResultMapItem(BaseModel):
     user: str | None = None
     generation: Generation | None = None
     location: Location | None = None
+    transport: Transport | None = None
+    speed_type: SpeedType | None = None
     count: int | None = None
     limit: int | None = None
     butler_config: str | None = None
@@ -122,6 +143,14 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
     "name": SASQUATCH_DB,
     "fields": [
         {
+            "name": "id",
+            "type": "string",
+        },
+        {
+            "name": "run_id",
+            "type": "string",
+        },
+        {
             "name": "url",
             "type": "string",
         },
@@ -153,7 +182,7 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
             "name": "user",
             "type": "string",
         },
-        # These next two are really enums, but then the namespace
+        # These next four are really enums, but then the namespace
         # gets in the way.
         {
             "name": "generation",
@@ -161,6 +190,14 @@ _RESULT_MAP_ITEM_SASQUATCH_SCHEMA = {
         },
         {
             "name": "location",
+            "type": "string",
+        },
+        {
+            "name": "transport",
+            "type": "string",
+        },
+        {
+            "name": "speed_type",
             "type": "string",
         },
         {
@@ -241,14 +278,6 @@ class ResultStatistics(BaseModel):
 
 type TimeSeries = dict[datetime, float | int]
 """Mapping of instant to a numeric value at that time."""
-
-
-class SpeedType(StrEnum):
-    """Whether a speed is reported or measured by elapsed time."""
-
-    MEASURED = "measured"
-    REPORTED = "reported"
-
 
 class DumperUserList(UserList):
     def model_dump(self) -> list[dict[str, Any]]:
@@ -363,10 +392,11 @@ class ResultMapItemList(DumperUserList[_T]):
         return self._speed_deltas(SpeedType.MEASURED)
 
     def _speed_deltas(self, speed_type: SpeedType) -> TimeSeries:
-        attr = "speed_" + speed_type
         deltas = {}
         for item in self.data:
-            value = getattr(item, attr)
+            value = item.speed
+            if item.speed_type != speed_type:
+                continue
             # It's possible that two measurements start or end
             # at the same instant.
             if item.start_time is not None:
@@ -456,226 +486,6 @@ class ResultMapItemList(DumperUserList[_T]):
                 ]
             ),
         )
-
-
-class ResultMap(BaseModel):
-    """Results for a particular dataset."""
-
-    # model_config = ConfigDict(
-    #    arbitrary_types_allowed=True
-    # )
-
-    butler_config: str
-    butler_collections: str
-    display_name: str
-    dataset_name: str
-    node: str | None = None
-    user: str | None = None
-    count: int | None = None
-    limit: int | None = None
-    generation: Generation | None = None
-    location: Location | None = None
-    debug: bool = False
-    result_items: ResultMapItemList = ResultMapItemList([])
-
-    @property
-    def sizes(self) -> list[int]:
-        """Return sizes associated with measurements."""
-        return self.result_items.sizes
-
-    @property
-    def speeds_measured(self) -> list[float]:
-        """Return speeds as measured by elapsed time."""
-        return self.result_items.speeds_measured
-
-    @property
-    def speeds_reported(self) -> list[float]:
-        """Return speeds as reported by ``curl``."""
-        return self.result_items.speeds_reported
-
-    @property
-    def speeds_ratio(self) -> list[float]:
-        """Return ratios of reported to measured speeds."""
-        return self.result_items.speeds_ratio
-
-    @property
-    def start_times(self) -> list[datetime.datetime | None]:
-        """Return measurement start times."""
-        return self.result_items.start_times
-
-    @property
-    def end_times(self) -> list[datetime.datetime | None]:
-        """Return measurement end times."""
-        return self.result_items.end_times
-
-    @property
-    def elapsed_times(self) -> list[datetime.timedelta | None]:
-        """Return elapsed times of measurement."""
-        return self.result_items.elapsed_times
-
-    @property
-    def urls(self) -> list[str]:
-        """Return urls fetched for measurements."""
-        return self.result_items.urls
-
-    @property
-    def statistics(self) -> ResultStatistics:
-        """Statistics for HTTP fetch speed, size, and times."""
-        return self.result_items.statistics
-
-    @property
-    def speed_deltas_reported(self) -> TimeSeries:
-        """Return reported speed increases/decreases over time."""
-        return self.result_items.speed_deltas.reported
-
-    @property
-    def speed_deltas_measured(self) -> TimeSeries:
-        """Return measured speed increases/decreases over time."""
-        return self.result_items.speed_deltas_measured
-
-    @property
-    def events(self) -> list[datetime.datetime]:
-        """Return list of times when speed changed."""
-        return self.result_items.events
-
-    @property
-    def aggregate_speeds_reported(self) -> TimeSeries:
-        """Return list of all reported speeds-at-an-instant."""
-        return self.result_items.aggregate_speeds_reported
-
-    @property
-    def aggregate_speeds_measured(self) -> TimeSeries:
-        """Return list of all measured speeds-at-an-instant."""
-        return self.result_items.aggregate_speeds_measured
-
-    @property
-    def aggregate_bytes(self) -> TimeSeries:
-        """Return list of total bytes transferred up to each event."""
-        return self.result_items.aggregate_bytes
-
-    @property
-    def total_bytes(self) -> float:
-        """Return total bytes transferred over the measurement series."""
-        return self.result_items.total_bytes
-
-    @property
-    def total_elapsed_time(self) -> datetime.timedelta:
-        """Return total time taken by the measurement series."""
-        return self.result_items.total_elapsed_time
-
-    @property
-    def average_speed(self) -> TimeSeries:
-        """Return average speed as total bytes transferred over all time."""
-        return self.result_items.average_speed
-
-
-class ResultMapList(DumperUserList[_T]):
-    """A list of ResultMaps, possibly with some special features."""
-
-    def __init__(self, iterable: Sequence[ResultMap]):
-        super().__init__(item for item in iterable)
-
-
-class RatioContainer(BaseModel):
-    """This always holds at least one series of data.  It may hold two;
-    we use this to resample a given set of URLs to investigate caching behavior."""
-
-    butler_config: str
-    butler_collections: str
-    display_name: str
-    dataset_name: str
-    count: int
-    limit: int
-    node: str
-    user: str
-    initial: ResultMap
-    recheck: ResultMap | None = None
-    ratios_measured: list[float] | None = None
-    ratios_reported: list[float] | None = None
-
-    def calculate_ratios(self) -> None:
-        """Calculate ratios of initial-to-recheck speeds."""
-        m_ratios: list[float] = []
-        r_ratios: list[float] = []
-        if not self.recheck or not self.recheck.result_items:
-            return
-        self._validate_paired_resultmaps()
-        for idx, i_itm in enumerate(self.initial.result_items):
-            r_itm = self.recheck.result_items[idx]
-            _have_results_check_result_map_items(i_itm, r_itm, idx)
-            m_ratios.append(r_itm.speed_measured / i_itm.speed_measured)
-            r_ratios.append(r_itm.speed_reported / i_itm.speed_reported)
-        if m_ratios:
-            self.ratios_measured = m_ratios
-        if r_ratios:
-            self.ratios_reported = r_ratios
-
-    @property
-    def ratio_statistics_measured(self) -> Statistics | None:
-        if not self.ratios_measured:
-            self.calculate_ratios()
-        if not self.ratios_measured:
-            return None
-        return Statistics.from_list(self.ratios_measured)
-
-    @property
-    def ratio_statistics_reported(self) -> Statistics | None:
-        if not self.ratios_reported:
-            self.calculate_ratios()
-        if not self.ratios_reported:
-            return None
-        return Statistics.from_list(self.ratios_reported)
-
-    @property
-    def measurements(self) -> ResultMapItemList:
-        retval = ResultMapItemList([])
-        retval.extend(list(self.initial.result_items))
-        if self.recheck:
-            retval.extend(list(self.recheck.result_items))
-        return retval
-
-    def _validate_paired_resultmaps(self) -> None:
-        # Ensure that the initial and recheck maps have the same
-        # number of items, and that the urls and sizes of each
-        # item match.
-        if not self.recheck:
-            raise ValueError("No recheck result map")
-        if not self.recheck.result_items:
-            raise ValueError("No recheck result items")
-        iin = len(self.initial.result_items)
-        rin = len(self.recheck.result_items)
-        if iin != rin:
-            raise ValueError(
-                f"Initial map: {iin} items != {rin} for recheck map"
-            )
-        for idx, iit in enumerate(self.initial.result_items):
-            rit = self.recheck.result_items[idx]
-            _sanity_check_result_map_items(iit, rit)
-
-    def _prepare_recheck_items(self) -> None:
-        if not self.recheck:
-            raise ValueError("No recheck result map")
-        if not self.recheck.result_items:
-            raise ValueError("No recheck result items")
-        for idx, iit in enumerate(self.initial.result_items):
-            rit = self.recheck.result_items[idx]
-            rit.url = iit.url  # Copy, not reference
-            rit.size = iit.size
-
-
-class RatioContainerList(DumperUserList[_T]):
-    """A list of RatioContainers, possibly with some special properties."""
-
-    def __init__(self, iterable: Sequence[RatioContainer]):
-        super().__init__(item for item in iterable)
-
-    @property
-    def measurements(self) -> ResultMapItemList:
-        retval = ResultMapItemList([])
-        for ratc in self.data:
-            retval.extend(list(ratc.measurements))
-        return retval
-
 
 # Configuration object class
 
@@ -833,6 +643,7 @@ class _SpeedHelper:
     start_time: datetime.datetime
     end_time: datetime.datetime
     speed: float
+    speed_reported: float | None = None
 
 
 @dataclass
@@ -1189,7 +1000,7 @@ class Benchmarker:
         item.measurement_number = measurement_number
         self._logger.debug(f"{itemstr}: speed {res.speed:.02f} bytes/s;")
 
-    async def _fetch_item(self, rm_item: ResultMapItem) -> _SpeedHelper:
+    async def _fetch_item_butler(self, rm_item: ResultMapItem) -> _SpeedHelper:
         """Get speed of transfer."""
         if not rm_item.ds_ref:
             raise RuntimeError(f"No DatasetRef for {rm_item.url}")
@@ -1204,6 +1015,53 @@ class Benchmarker:
             raise RuntimeError(f"{rm_item.url} fetched infinitely fast.")
         speed = rm_item.size / ((et - st).total_seconds())
         return _SpeedHelper(start_time=st, end_time=et, speed=speed)
+
+    async def _fetch_item_curl(self, url: str) -> _SpeedHelper:
+        """Get speed of transfer.
+
+        If we're slower than 50kB/s for 30 seconds, abort.  That will break
+        the run, because we won't have all the samples we expect, so no point
+        in catching a bad conversion."""
+        curl = self._curl
+        # If we're slower than 50kB/s for 30 seconds, abort.
+        # That will break the run, since we will have None for some of
+        # our sample values (the tasks will throw exceptions and
+        # not update their speed fields).
+        proc = await asyncio.create_subprocess_exec(
+            curl,
+            url,
+            "-Y",
+            "50000",
+            "-o",
+            "/dev/null",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # Reported speed ought to be slightly higher than
+        # measured speed, because measured speed includes the overhead
+        # of the curl process outside its fetch loop too.
+        #
+        # However, measured speed is much more granular, so the rounding
+        # inherent in reported speed might make it slightly slower.
+        # If reported speed varies outside the window of "slightly slower"
+        # to "somewhat faster" then....
+        #
+        # ...that's why we track it: we can scale-test and see if at some
+        # point, we have so many processes running that process thrashing
+        # is taking up a significant fraction of our (wall-clock) time.
+        st = _now()
+        stdout, stderr = await proc.communicate()
+        et = _now()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Getting fetch speed for '{url}' failed"
+                f" rc={proc.returncode},"
+                f" stdout='{stdout}',"
+                f" stderr='{stderr}'"
+            )
+        # Last field is speed (string, suffixed with binary units).
+        r_spd = stderr.decode().strip().split()[-1]
+        return _SpeedHelper(start_time=st, end_time=et, reported_speed=r_spd)
 
     def _build_results(self) -> RatioContainerList:
         """From a list of parameters for a given Butler config and
